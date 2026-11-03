@@ -1,14 +1,16 @@
 import asyncio
+import fcntl
 import logging
 import signal
 import sys
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Any
 
 from config import Config
 from telegram_client import TelegramClient
-from agy_engine import AgyEngine
+from agy_engine import AgyEngine, KNOWN_MODELS, normalize_model_name
 from terminal_ui import TerminalUI
 from question_parser import QuestionParser, QuestionChoice
+from history_manager import HistoryManager
 
 # Setup basic logging
 logging.basicConfig(
@@ -24,11 +26,52 @@ class BotApp:
         self.ui = TerminalUI()
         self.client: Optional[TelegramClient] = None
         self.engine: Optional[AgyEngine] = None
+        self.history = HistoryManager()
 
         self.last_chat_id: Optional[int] = None
         self.pending_choices: Dict[int, str] = {} # choice_index -> choice_value
         self.is_processing = False
         self._shutdown_event = asyncio.Event()
+
+    def get_reply_keyboard(self) -> Dict[str, Any]:
+        """Persistent bottom keyboard for Telegram on mobile/desktop."""
+        return self.client.build_reply_keyboard([
+            ["🛑 Stop", "➕ Nuova Chat"],
+            ["📜 Cronologia", "📊 Stato"],
+            ["🧠 Modello", "📋 Menu"]
+        ], resize_keyboard=True, is_persistent=True)
+
+    def get_inline_menu(self) -> Dict[str, Any]:
+        """Interactive inline menu attached to messages."""
+        return self.client.build_inline_keyboard([
+            [
+                {"text": "🛑 Stop", "callback_data": "menu:stop"},
+                {"text": "➕ Nuova Chat", "callback_data": "menu:new"}
+            ],
+            [
+                {"text": "📜 Cronologia", "callback_data": "menu:history"},
+                {"text": "📊 Stato", "callback_data": "menu:status"}
+            ],
+            [
+                {"text": "🧠 Seleziona Modello", "callback_data": "menu:models"}
+            ]
+        ])
+
+    def get_model_keyboard(self) -> Dict[str, Any]:
+        """Interactive inline keyboard for selecting available AI models."""
+        popular_models = [
+            "Gemini 3.8 Flash (Medium)",
+            "Gemini 4 Argon (Medium)",
+            "Claude Sonnet 5.5 (Medium)",
+            "Claude Opus 5.5 (Medium)",
+            "GPT-OSS 120B (Medium)"
+        ]
+        rows = []
+        for m in popular_models:
+            is_active = "✅ " if m.lower() == self.engine.model.lower() else ""
+            rows.append([{"text": f"{is_active}{m}", "callback_data": f"setmodel:{m}"}])
+        rows.append([{"text": "🔙 Torna al Menu", "callback_data": "menu:main"}])
+        return self.client.build_inline_keyboard(rows)
 
     async def initialize(self) -> bool:
         if not self.config.bot_token or "YOUR_TELEGRAM_BOT_TOKEN" in self.config.bot_token:
@@ -55,6 +98,17 @@ class BotApp:
 
         bot_username = me.get("username", "UnknownBot")
 
+        # Register official bot commands in Telegram
+        bot_commands = [
+            {"command": "menu", "description": "📋 Mostra il menu principale e pulsanti"},
+            {"command": "stop", "description": "🛑 Ferma l'attività in corso"},
+            {"command": "new", "description": "➕ Nuova chat / resetta sessione"},
+            {"command": "history", "description": "📜 Mostra la cronologia della chat"},
+            {"command": "status", "description": "📊 Visualizza lo stato del bot"},
+            {"command": "model", "description": "🧠 Visualizza o cambia il modello AI"}
+        ]
+        await self.client.set_my_commands(bot_commands)
+
         self.engine = AgyEngine(
             agy_path=self.config.agy_path,
             workspace_path=self.config.workspace_path,
@@ -76,12 +130,127 @@ class BotApp:
 
         return True
 
+    # --- Actions ---
+
+    async def cmd_stop(self, chat_id: Optional[int] = None):
+        """Stops the active agy turn."""
+        target_chat = chat_id or self.last_chat_id
+        if self.engine and self.engine.stop_current_task():
+            self.ui.log_success("Stopped agent task by request.")
+            if target_chat and self.client:
+                await self.client.send_message(
+                    target_chat,
+                    "🛑 *Attività interrotta con successo.*",
+                    reply_markup=self.get_reply_keyboard(),
+                    parse_mode="Markdown"
+                )
+        else:
+            self.ui.log_info("Stop requested, but no active task running.")
+            if target_chat and self.client:
+                await self.client.send_message(
+                    target_chat,
+                    "ℹ️ *Nessuna attività in corso da interrompere.*",
+                    reply_markup=self.get_reply_keyboard(),
+                    parse_mode="Markdown"
+                )
+
+    async def cmd_new(self, chat_id: Optional[int] = None):
+        """Resets the conversation and starts a new session."""
+        target_chat = chat_id or self.last_chat_id
+        if self.engine:
+            self.engine.reset_conversation()
+        self.history.new_session()
+        self.pending_choices.clear()
+        self.ui.log_success("Conversation reset. Started a fresh session.")
+        if target_chat and self.client:
+            await self.client.send_message(
+                target_chat,
+                "🔄 *Nuova sessione di chat avviata!*\nLa conversazione precedente è stata archiviata. Puoi iniziare con una nuova richiesta.",
+                reply_markup=self.get_reply_keyboard(),
+                parse_mode="Markdown"
+            )
+
+    async def cmd_history(self, chat_id: Optional[int] = None):
+        """Displays chat history of the active session."""
+        target_chat = chat_id or self.last_chat_id
+        if not target_chat or not self.client:
+            print(self.history.format_history_summary())
+            return
+
+        summary = self.history.format_history_summary()
+        inline_rows = []
+        if self.history.get_last_turn():
+            inline_rows.append([{"text": "📄 Leggi ultima risposta completa", "callback_data": "history:last"}])
+        inline_rows.append([
+            {"text": "➕ Nuova Chat", "callback_data": "menu:new"},
+            {"text": "🧹 Svuota", "callback_data": "history:clear"}
+        ])
+
+        reply_markup = self.client.build_inline_keyboard(inline_rows)
+        await self.client.send_message(
+            target_chat,
+            summary,
+            reply_markup=reply_markup,
+            parse_mode="Markdown"
+        )
+
+    async def cmd_status(self, chat_id: Optional[int] = None):
+        """Displays current bot status."""
+        target_chat = chat_id or self.last_chat_id
+        status_text = "⏳ *In elaborazione...*" if self.is_processing else "🟢 *Pronto (In attesa)*"
+        turns_count = len(self.history.get_current_turns())
+        msg = (
+            f"📊 *Stato Antigravity Bridge*\n\n"
+            f"• *Stato:* {status_text}\n"
+            f"• *Modello:* `{self.engine.model}`\n"
+            f"• *Workspace:* `{self.config.workspace_path}`\n"
+            f"• *Messaggi sessione:* `{turns_count}`\n"
+            f"• *ID Sessione:* `{self.history.active_session_id}`"
+        )
+        if target_chat and self.client:
+            await self.client.send_message(
+                target_chat,
+                msg,
+                reply_markup=self.get_reply_keyboard(),
+                parse_mode="Markdown"
+            )
+        else:
+            self.ui.log_info(msg.replace("*", "").replace("`", ""))
+
+    async def cmd_models(self, chat_id: Optional[int] = None):
+        """Displays model switcher."""
+        target_chat = chat_id or self.last_chat_id
+        if target_chat and self.client:
+            await self.client.send_message(
+                target_chat,
+                f"🧠 *Selezione Modello AI*\nModello attualmente attivo: `{self.engine.model}`\n\nScegli un modello da applicare:",
+                reply_markup=self.get_model_keyboard(),
+                parse_mode="Markdown"
+            )
+
+    async def cmd_menu(self, chat_id: Optional[int] = None):
+        """Displays the main interactive menu."""
+        target_chat = chat_id or self.last_chat_id
+        if target_chat and self.client:
+            text = (
+                "📋 *Pannello di Controllo Antigravity*\n\n"
+                "Usa i pulsanti interattivi qui sotto o la tastiera fissata in basso:"
+            )
+            await self.client.send_message(
+                target_chat,
+                text,
+                reply_markup=self.get_inline_menu(),
+                parse_mode="Markdown"
+            )
+
+    # --- Prompt handling ---
+
     async def handle_prompt(self, prompt: str, source: str = "telegram", chat_id: Optional[int] = None):
         """Dispatches a prompt turn to the agy engine and streams/sends results."""
         if self.is_processing:
-            msg = "⏳ An agent turn is already running! Send /stop to cancel it first."
+            msg = "⏳ Un comando è già in esecuzione! Premi *Stop* per annullarlo prima."
             if source == "telegram" and chat_id:
-                await self.client.send_message(chat_id, msg)
+                await self.client.send_message(chat_id, msg, reply_markup=self.get_reply_keyboard(), parse_mode="Markdown")
             else:
                 self.ui.log_warn(msg)
             return
@@ -113,6 +282,9 @@ class BotApp:
 
             self.ui.log_agent_complete(output)
 
+            # Record turn in chat history
+            self.history.add_turn(prompt, output, self.engine.model)
+
             # Check if output contains a multiple-choice question
             question_data = QuestionParser.extract_question(output)
 
@@ -125,7 +297,7 @@ class BotApp:
                     self.pending_choices[choice.index] = choice.value
 
                 if target_chat and self.client:
-                    # Build Telegram inline keyboard buttons
+                    # Build Telegram inline keyboard buttons for multiple choices
                     keyboard_rows = []
                     for choice in choices:
                         keyboard_rows.append([{
@@ -143,16 +315,29 @@ class BotApp:
                     )
             else:
                 if target_chat and self.client:
-                    await self.client.send_message(target_chat, output, parse_mode="Markdown")
+                    await self.client.send_message(
+                        target_chat,
+                        output,
+                        reply_markup=self.get_reply_keyboard(),
+                        parse_mode="Markdown"
+                    )
 
         except asyncio.CancelledError:
             self.ui.log_warn("Task cancelled.")
             if target_chat and self.client:
-                await self.client.send_message(target_chat, "🛑 Task was cancelled.")
+                await self.client.send_message(
+                    target_chat,
+                    "🛑 Attività annullata.",
+                    reply_markup=self.get_reply_keyboard()
+                )
         except Exception as e:
             self.ui.log_error(f"Error handling prompt: {e}")
             if target_chat and self.client:
-                await self.client.send_message(target_chat, f"❌ Error: {e}")
+                await self.client.send_message(
+                    target_chat,
+                    f"❌ Errore: {e}",
+                    reply_markup=self.get_reply_keyboard()
+                )
         finally:
             self.is_processing = False
             if typing_task and not typing_task.done():
@@ -177,39 +362,35 @@ class BotApp:
                 self._shutdown_event.set()
                 return
             elif cmd in ["/stop", "/cancel"]:
-                if self.engine and self.engine.stop_current_task():
-                    self.ui.log_success("Stopped agent task.")
-                else:
-                    self.ui.log_info("No agent task is currently running.")
+                await self.cmd_stop()
                 return
             elif cmd in ["/new", "/reset"]:
-                if self.engine:
-                    self.engine.reset_conversation()
-                    self.pending_choices.clear()
-                    self.ui.log_success("Conversation reset. Started a fresh session.")
-                    if self.last_chat_id and self.client:
-                        await self.client.send_message(self.last_chat_id, "🔄 *Conversation reset.* Started a fresh session.")
+                await self.cmd_new()
                 return
-            elif cmd == "/status":
-                status = "Busy" if self.is_processing else "Idle"
-                self.ui.log_info(f"Status: {status} | Model: {self.engine.model} | Workspace: {self.config.workspace_path}")
+            elif cmd in ["/history", "/cronologia"]:
+                await self.cmd_history()
                 return
-            elif cmd == "/model":
+            elif cmd in ["/status", "/stato"]:
+                await self.cmd_status()
+                return
+            elif cmd in ["/model", "/modello"]:
                 if arg:
-                    self.engine.model = arg
-                    self.config.default_model = arg
+                    norm = normalize_model_name(arg)
+                    self.engine.model = norm
+                    self.config.default_model = norm
                     self.config.save()
-                    self.ui.log_success(f"Model switched to: {arg}")
+                    self.ui.log_success(f"Model switched to: {norm}")
                 else:
                     self.ui.log_info(f"Current model: {self.engine.model}")
                 return
             elif cmd == "/help":
                 print("Available commands:")
-                print("  /status      - Show current bot status")
-                print("  /new         - Reset and start fresh conversation")
-                print("  /stop        - Stop active turn")
-                print("  /model <m>   - Switch model (e.g. gemini-2.5-pro)")
-                print("  /exit        - Exit application")
+                print("  /status      - Mostra lo stato del bot")
+                print("  /new         - Resetta e avvia una nuova sessione")
+                print("  /history     - Mostra la cronologia della sessione")
+                print("  /stop        - Ferma l'attività in corso")
+                print("  /model <m>   - Cambia modello AI")
+                print("  /exit        - Chiudi l'applicazione")
                 return
 
         # Check if user typed a choice number (1, 2, 3...) when a question is pending
@@ -221,7 +402,12 @@ class BotApp:
                     self.ui.log_success(f"Selected option #{choice_idx}: {selected_val}")
                     self.pending_choices.clear()
                     if self.last_chat_id and self.client:
-                        await self.client.send_message(self.last_chat_id, f"💻 *Selected from PC Terminal:* {selected_val}")
+                        await self.client.send_message(
+                            self.last_chat_id,
+                            f"💻 *Selected from PC Terminal:* {selected_val}",
+                            reply_markup=self.get_reply_keyboard(),
+                            parse_mode="Markdown"
+                        )
                     await self.handle_prompt(selected_val, source="local")
                     return
             except ValueError:
@@ -229,7 +415,12 @@ class BotApp:
 
         # Broadcast notice to Telegram if user initiated prompt from terminal
         if self.last_chat_id and self.client:
-            await self.client.send_message(self.last_chat_id, f"💻 *[From PC Terminal]:* {text}")
+            await self.client.send_message(
+                self.last_chat_id,
+                f"💻 *[From PC Terminal]:* {text}",
+                reply_markup=self.get_reply_keyboard(),
+                parse_mode="Markdown"
+            )
 
         await self.handle_prompt(text, source="local")
 
@@ -269,6 +460,7 @@ class BotApp:
             self.last_chat_id = chat_id
             await self.client.answer_callback_query(cq_id)
 
+            # A. Multiple choice response
             if data.startswith("choice:"):
                 try:
                     choice_idx = int(data.split(":", 1)[1])
@@ -292,6 +484,74 @@ class BotApp:
 
                 # Send selected option to agy as next turn
                 await self.handle_prompt(selected_val, source="telegram", chat_id=chat_id)
+                return
+
+            # B. Menu actions
+            if data == "menu:stop":
+                await self.cmd_stop(chat_id)
+                return
+            elif data == "menu:new":
+                await self.cmd_new(chat_id)
+                return
+            elif data == "menu:history":
+                await self.cmd_history(chat_id)
+                return
+            elif data == "menu:status":
+                await self.cmd_status(chat_id)
+                return
+            elif data == "menu:models":
+                await self.cmd_models(chat_id)
+                return
+            elif data == "menu:main":
+                await self.cmd_menu(chat_id)
+                return
+
+            # C. Model selection
+            if data.startswith("setmodel:"):
+                model_name = data.split(":", 1)[1]
+                norm = normalize_model_name(model_name)
+                self.engine.model = norm
+                self.config.default_model = norm
+                self.config.save()
+                self.ui.log_success(f"Model switched to {norm} via Telegram")
+                if msg.get("message_id"):
+                    await self.client.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=msg["message_id"],
+                        text=f"✅ *Modello aggiornato a:* `{norm}`",
+                        reply_markup=None,
+                        parse_mode="Markdown"
+                    )
+                return
+
+            # D. History actions
+            if data == "history:last":
+                last_turn = self.history.get_last_turn()
+                if last_turn:
+                    resp = last_turn.get("response", "Nessuna risposta disponibile.")
+                    await self.client.send_message(
+                        chat_id,
+                        f"📄 *Ultima risposta completa:*\n\n{resp}",
+                        reply_markup=self.get_reply_keyboard(),
+                        parse_mode="Markdown"
+                    )
+                else:
+                    await self.client.send_message(
+                        chat_id,
+                        "Nessun turno disponibile.",
+                        reply_markup=self.get_reply_keyboard()
+                    )
+                return
+            elif data == "history:clear":
+                self.history.clear_active_session()
+                await self.client.send_message(
+                    chat_id,
+                    "🧹 *Cronologia della sessione attiva svuotata.*",
+                    reply_markup=self.get_reply_keyboard(),
+                    parse_mode="Markdown"
+                )
+                return
+
             return
 
         # 2. Handle Text Messages
@@ -318,57 +578,79 @@ class BotApp:
             self.last_chat_id = chat_id
             self.ui.log_telegram_in(user_name, text)
 
-            # Commands
-            if text == "/start":
+            text_lower = text.lower().strip()
+
+            # Commands & Button Presses
+            if text_lower in ["/start", "start"]:
                 welcome = (
-                    f"👋 *Hello {user_name}! Antigravity is connected.*\n\n"
-                    f"• *Model:* `{self.engine.model}`\n"
+                    f"👋 *Ciao {user_name}! Antigravity Bridge è connesso.*\n\n"
+                    f"• *Modello:* `{self.engine.model}`\n"
                     f"• *Workspace:* `{self.config.workspace_path}`\n\n"
-                    "You can now send any prompt, instruction, or coding task from your phone.\n"
-                    "If the agent needs your input, it will send interactive buttons right here!\n\n"
-                    "Commands:\n"
-                    "/status - Show current state\n"
-                    "/new - Start fresh conversation\n"
-                    "/stop - Stop running agent turn\n"
-                    "/model <name> - Switch Gemini model"
+                    "Puoi inviare prompt, istruzioni o richieste di codice in qualsiasi momento.\n"
+                    "Usa i comodi pulsanti qui sotto per gestire il flusso di lavoro!"
                 )
-                await self.client.send_message(chat_id, welcome, parse_mode="Markdown")
-                return
-
-            if text in ["/new", "/reset"]:
-                self.engine.reset_conversation()
-                self.pending_choices.clear()
-                self.ui.log_success("Conversation reset by Telegram user.")
-                await self.client.send_message(chat_id, "🔄 *Conversation reset.* Started a fresh session.")
-                return
-
-            if text in ["/stop", "/cancel"]:
-                if self.engine and self.engine.stop_current_task():
-                    await self.client.send_message(chat_id, "🛑 Agent task was stopped.")
-                    self.ui.log_success("Stopped agent task by Telegram request.")
-                else:
-                    await self.client.send_message(chat_id, "ℹ️ No task is currently running.")
-                return
-
-            if text == "/status":
-                status = "Busy" if self.is_processing else "Idle"
                 await self.client.send_message(
                     chat_id,
-                    f"📊 *Bot Status:*\n• State: `{status}`\n• Model: `{self.engine.model}`\n• Workspace: `{self.config.workspace_path}`"
+                    welcome,
+                    reply_markup=self.get_reply_keyboard(),
+                    parse_mode="Markdown"
                 )
                 return
 
-            if text.startswith("/model"):
-                parts = text.split(maxsplit=1)
-                if len(parts) > 1:
-                    new_model = parts[1].strip()
-                    self.engine.model = new_model
-                    self.config.default_model = new_model
+            if text_lower in ["🛑 stop", "stop", "/stop", "/cancel"]:
+                await self.cmd_stop(chat_id)
+                return
+
+            if text_lower in ["➕ nuova chat", "nuova chat", "new chat", "new", "/new", "/reset"]:
+                await self.cmd_new(chat_id)
+                return
+
+            if text_lower in ["📜 cronologia", "cronologia", "history", "/history", "/cronologia"]:
+                await self.cmd_history(chat_id)
+                return
+
+            if text_lower in ["📊 stato", "stato", "status", "/status"]:
+                await self.cmd_status(chat_id)
+                return
+
+            if text_lower in ["🧠 modello", "modello", "model", "/model"]:
+                if text_lower.startswith("/model") and len(text.split(maxsplit=1)) > 1:
+                    new_model = text.split(maxsplit=1)[1].strip()
+                    norm = normalize_model_name(new_model)
+                    self.engine.model = norm
+                    self.config.default_model = norm
                     self.config.save()
-                    await self.client.send_message(chat_id, f"✅ Active model updated to: `{new_model}`")
-                    self.ui.log_success(f"Model switched to {new_model} via Telegram")
+                    await self.client.send_message(
+                        chat_id,
+                        f"✅ Modello aggiornato a: `{norm}`",
+                        reply_markup=self.get_reply_keyboard(),
+                        parse_mode="Markdown"
+                    )
+                    self.ui.log_success(f"Model switched to {norm} via Telegram")
                 else:
-                    await self.client.send_message(chat_id, f"Current model: `{self.engine.model}`\nUsage: `/model gemini-2.5-pro`")
+                    await self.cmd_models(chat_id)
+                return
+
+            if text_lower in ["📋 menu", "menu", "/menu"]:
+                await self.cmd_menu(chat_id)
+                return
+
+            if text_lower in ["/help", "help", "aiuto"]:
+                help_msg = (
+                    "ℹ️ *Guida Comandi Antigravity*\n\n"
+                    "• *🛑 Stop:* Interrompe l'elaborazione dell'agente se in corso\n"
+                    "• *➕ Nuova Chat:* Avvia una nuova sessione pulita\n"
+                    "• *📜 Cronologia:* Mostra i messaggi e turni della sessione corrente\n"
+                    "• *📊 Stato:* Informazioni sul modello attivo e cartella di lavoro\n"
+                    "• *🧠 Modello:* Menu interattivo per cambiare modello AI\n"
+                    "• *📋 Menu:* Visualizza il pannello comandi inline"
+                )
+                await self.client.send_message(
+                    chat_id,
+                    help_msg,
+                    reply_markup=self.get_reply_keyboard(),
+                    parse_mode="Markdown"
+                )
                 return
 
             # Check if user typed a choice number (1, 2, 3...) when a question is pending
@@ -378,7 +660,12 @@ class BotApp:
                     if choice_idx in self.pending_choices:
                         selected_val = self.pending_choices[choice_idx]
                         self.pending_choices.clear()
-                        await self.client.send_message(chat_id, f"✅ *Selected:* {selected_val}")
+                        await self.client.send_message(
+                            chat_id,
+                            f"✅ *Selected:* {selected_val}",
+                            reply_markup=self.get_reply_keyboard(),
+                            parse_mode="Markdown"
+                        )
                         await self.handle_prompt(selected_val, source="telegram", chat_id=chat_id)
                         return
                 except ValueError:
@@ -409,6 +696,15 @@ class BotApp:
             self.ui.stop()
 
 def main():
+    lock_file = open("/tmp/aibot.lock", "w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, IOError):
+        print("\n\033[31m[ERROR] Un'altra istanza del bot è già attiva!\033[0m")
+        print("Termina la vecchia istanza con:")
+        print("  \033[1mpkill -f 'python.*main.py'\033[0m\n")
+        sys.exit(1)
+
     app = BotApp()
 
     loop = asyncio.new_event_loop()

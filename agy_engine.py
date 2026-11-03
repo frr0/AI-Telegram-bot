@@ -6,17 +6,48 @@ from typing import AsyncGenerator, Optional, Tuple, Callable
 
 logger = logging.getLogger("agy_engine")
 
+KNOWN_MODELS = [
+    "Gemini 4 Argon (Medium)",
+    "Gemini 4 Argon (High)",
+    "Gemini 4 Argon (Low)",
+    "Gemini 3.8 Flash (High)",
+    "Gemini 3.8 Flash (Medium)",
+    "Gemini 3.8 Flash (Low)",
+    "Claude Opus 5.5 (Low)",
+    "Claude Opus 5.5 (Medium)",
+    "Claude Opus 5.5 (High)",
+    "Claude Sonnet 5.5 (Low)",
+    "Claude Sonnet 5.5 (Medium)",
+    "Claude Sonnet 5.5 (High)",
+    "GPT-OSS 120B (Medium)",
+]
+
+def normalize_model_name(model_name: Optional[str]) -> str:
+    if not model_name:
+        return "Gemini 3.8 Flash (Medium)"
+    # Exact case-insensitive match
+    for km in KNOWN_MODELS:
+        if model_name.strip().lower() == km.lower():
+            return km
+    # Match without effort, defaulting to (Medium)
+    cleaned = model_name.strip().lower().replace("-", " ")
+    for km in KNOWN_MODELS:
+        base = km.split("(")[0].strip().lower()
+        if cleaned == base and "(medium)" in km.lower():
+            return km
+    return model_name.strip()
+
 class AgyEngine:
     def __init__(
         self,
         agy_path: str,
         workspace_path: str,
-        default_model: str = "gemini-2.5-pro",
+        default_model: str = "Gemini 3.8 Flash (Medium)",
         dangerously_skip_permissions: bool = True
     ):
         self.agy_path = agy_path
         self.workspace_path = workspace_path
-        self.model = default_model
+        self.model = normalize_model_name(default_model)
         self.dangerously_skip_permissions = dangerously_skip_permissions
         self.current_process: Optional[asyncio.subprocess.Process] = None
         self.conversation_id: Optional[str] = None
@@ -59,8 +90,9 @@ class AgyEngine:
             # First turn: start fresh
             pass
 
-        if self.model:
-            cmd.extend(["--model", self.model])
+        norm_model = normalize_model_name(self.model)
+        if norm_model:
+            cmd.extend(["--model", norm_model])
 
         if self.dangerously_skip_permissions:
             cmd.append("--dangerously-skip-permissions")

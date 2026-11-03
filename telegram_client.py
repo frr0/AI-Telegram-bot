@@ -146,3 +146,35 @@ class TelegramClient:
         Takes a list of rows, each row containing {"text": "...", "callback_data": "..."}
         """
         return {"inline_keyboard": buttons}
+
+    @staticmethod
+    def build_reply_keyboard(
+        buttons: List[List[Union[str, Dict[str, Any]]]],
+        resize_keyboard: bool = True,
+        is_persistent: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Takes a list of rows, each row containing list of string labels or button dicts.
+        """
+        keyboard = []
+        for row in buttons:
+            row_btns = []
+            for btn in row:
+                if isinstance(btn, str):
+                    row_btns.append({"text": btn})
+                elif isinstance(btn, dict):
+                    row_btns.append(btn)
+            keyboard.append(row_btns)
+        return {
+            "keyboard": keyboard,
+            "resize_keyboard": resize_keyboard,
+            "is_persistent": is_persistent
+        }
+
+    async def set_my_commands(self, commands: List[Dict[str, str]]) -> bool:
+        """
+        Sets the list of the bot's commands in Telegram.
+        Each command dict has: {"command": "menu", "description": "Apri il menu"}
+        """
+        res = await self._request("setMyCommands", {"commands": commands})
+        return bool(res and res.get("ok"))

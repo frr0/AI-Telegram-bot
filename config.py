@@ -12,7 +12,7 @@ class Config:
         self.allowed_user_ids: List[int] = []
         self.workspace_path: str = str(Path(__file__).parent.resolve())
         self.agy_path: str = os.path.expanduser("~/.local/bin/agy")
-        self.default_model: str = "gemini-2.5-pro"
+        self.default_model: str = "Gemini 3.8 Flash"
         self.dangerously_skip_permissions: bool = True
         self.load()
 
@@ -40,7 +40,7 @@ class Config:
         self.allowed_user_ids = [int(uid) for uid in data.get("allowed_user_ids", [])]
         self.workspace_path = data.get("workspace_path", self.workspace_path)
         self.agy_path = data.get("agy_path", self.agy_path)
-        self.default_model = data.get("default_model", "gemini-2.5-pro")
+        self.default_model = data.get("default_model", "Gemini 3.8 Flash")
         self.dangerously_skip_permissions = data.get("dangerously_skip_permissions", True)
 
     def save(self):
