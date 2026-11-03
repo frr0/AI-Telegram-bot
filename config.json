@@ -1,0 +1,8 @@
+{
+  "bot_token": "PASTE_YOUR_TELEGRAM_BOT_TOKEN_HERE",
+  "allowed_user_ids": [],
+  "workspace_path": "/home/francesco/Progetti/AIbot",
+  "agy_path": "/home/francesco/.local/bin/agy",
+  "default_model": "gemini-2.5-pro",
+  "dangerously_skip_permissions": true
+}
