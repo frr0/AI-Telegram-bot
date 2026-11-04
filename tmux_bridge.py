@@ -197,9 +197,26 @@ class TmuxBridge:
         except Exception:
             return False
 
+    COMPLETION_PATTERNS = [
+        r"run has finished",
+        r"run has completed",
+        r"task completato",
+        r"attività completat",
+        r"all tasks complete",
+        r"all deliverables ready",
+        r"final project deliverables ready",
+        r"progetto completato",
+        r"richiesta completat",
+        r"execution finished",
+        r"execution complete"
+    ]
+
     def check_for_session_events(self) -> List[Dict[str, Any]]:
         """
-        Polls active agy sessions and returns events when a new update or question appears.
+        Polls active agy sessions and returns notifications ONLY if:
+        1. Agy asks to select an option / make a choice (event_type: 'question')
+        2. The request is completely finished (event_type: 'completed')
+        Filters out all intermediate logs, commands, and partial progress.
         """
         events = []
         sessions = self.discover_agy_sessions()
@@ -211,6 +228,7 @@ class TmuxBridge:
 
             main_text = parsed.get("main_text", "")
             is_waiting = parsed.get("is_waiting_input", False)
+            choices = parsed.get("choices", [])
             content_hash = hashlib.md5(main_text.encode("utf-8")).hexdigest()
 
             prev_hash = self._last_content_hashes.get(target)
@@ -223,33 +241,33 @@ class TmuxBridge:
             if prev_hash is None:
                 continue
 
-            if content_hash != prev_hash:
-                # Content changed
-                event_type = "question" if (is_waiting and parsed.get("choices")) else "update"
-                events.append({
-                    "target": target,
-                    "window_name": win_name,
-                    "cwd": s["cwd"],
-                    "event_type": event_type,
-                    "is_waiting_input": is_waiting,
-                    "subagents_count": parsed.get("subagents_count", 0),
-                    "main_text": main_text,
-                    "choices": parsed.get("choices", []),
-                    "snippet": parsed.get("snippet", "")
-                })
-            elif is_waiting and not prev_waiting:
-                # Became waiting for input
-                events.append({
-                    "target": target,
-                    "window_name": win_name,
-                    "cwd": s["cwd"],
-                    "event_type": "question" if parsed.get("choices") else "prompt",
-                    "is_waiting_input": True,
-                    "subagents_count": parsed.get("subagents_count", 0),
-                    "main_text": main_text,
-                    "choices": parsed.get("choices", []),
-                    "snippet": parsed.get("snippet", "")
-                })
+            # If no change in content or state, skip
+            if content_hash == prev_hash and not (is_waiting and not prev_waiting):
+                continue
+
+            lower_text = main_text.lower()
+            is_completed = any(re.search(pat, lower_text) for pat in self.COMPLETION_PATTERNS)
+            is_question = bool(choices) or (is_waiting and any(q_mark in main_text for q_mark in ["?", "Quale", "Scegli", "Come desideri", "[QUESTION:"]))
+
+            if is_question:
+                event_type = "question"
+            elif is_completed:
+                event_type = "completed"
+            else:
+                # Filter out regular intermediate progress updates!
+                continue
+
+            events.append({
+                "target": target,
+                "window_name": win_name,
+                "cwd": s["cwd"],
+                "event_type": event_type,
+                "is_waiting_input": is_waiting,
+                "subagents_count": parsed.get("subagents_count", 0),
+                "main_text": main_text,
+                "choices": choices,
+                "snippet": parsed.get("snippet", "")
+            })
 
         return events
 

@@ -29,6 +29,8 @@ class TestTeamworkMonitor(unittest.TestCase):
         # Immediately after, no change should be detected
         has_change2, diff2 = self.monitor.check_for_updates()
         self.assertFalse(has_change2)
+        # Verify that intermediate updates do not spam
+        self.assertFalse(has_change)
 
 
 if __name__ == "__main__":

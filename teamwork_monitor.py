@@ -171,30 +171,23 @@ class TeamworkMonitor:
         if current_hash != self._last_state_hash:
             self._last_state_hash = current_hash
 
-            # Determine what changed
-            current_handoffs = set(handoffs)
-            new_handoffs = current_handoffs - self._known_handoffs
-            self._known_handoffs = current_handoffs
-
-            desc_parts = []
-            if new_handoffs:
-                for nh in new_handoffs:
-                    agent_name = os.path.basename(os.path.dirname(nh))
-                    desc_parts.append(f"Nuovo report completato da `{agent_name}`")
-
+            # Check if project has reached full completion
+            is_final_complete = False
+            desc = ""
             if os.path.exists(self.progress_file):
                 try:
                     with open(self.progress_file, "r", encoding="utf-8") as f:
                         content = f.read()
-                    # Find completed milestones or checked items
-                    checked_items = re.findall(r'- \[x\] (.*)', content)
-                    if checked_items:
-                        latest = checked_items[-1]
-                        desc_parts.append(f"Progresso: *{latest}*")
+                    if "- [x] Final project deliverables ready" in content or "all deliverables ready" in content.lower():
+                        is_final_complete = True
+                        desc = "🎉 *Progetto News Completato!* Tutti i milestone e i deliverables finali sono pronti."
                 except Exception:
                     pass
 
-            desc = " • ".join(desc_parts) if desc_parts else "Avanzamento registrato nei task degli agenti."
-            return True, desc
+            if is_final_complete:
+                return True, desc
+
+            # Intermediate progress (scaffolding, builds, subagent handoffs): do not alert
+            return False, ""
 
         return False, ""

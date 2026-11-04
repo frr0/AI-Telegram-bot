@@ -11,7 +11,6 @@ class TestTmuxBridge(unittest.TestCase):
     def test_discover_sessions(self):
         sessions = self.bridge.discover_agy_sessions()
         self.assertIsInstance(sessions, list)
-        # News is currently running in 0:3.1
         if sessions:
             first = sessions[0]
             self.assertIn("target", first)
@@ -44,6 +43,72 @@ class TestTmuxBridge(unittest.TestCase):
         self.assertEqual(parsed["subagents_count"], 3)
         self.assertTrue(parsed["is_waiting_input"])
         self.assertIn("Milestone 1 in corso", parsed["main_text"])
+
+    def test_filter_intermediate_updates_no_event(self):
+        sample = """
+  Milestone 1 in corso
+  Running command npm install
+"""
+        with patch.object(self.bridge, "discover_agy_sessions", return_value=[{"target": "0:9.1", "window_name": "Test", "cwd": "/tmp"}]), \
+             patch.object(self.bridge, "inspect_pane", return_value={
+                 "main_text": sample,
+                 "is_waiting_input": False,
+                 "choices": [],
+                 "subagents_count": 2,
+                 "snippet": "Milestone 1 in corso"
+             }):
+            # First call establishes baseline
+            self.bridge.check_for_session_events()
+            # Second call with slightly different intermediate text
+            with patch.object(self.bridge, "inspect_pane", return_value={
+                "main_text": sample + "\nNext command",
+                "is_waiting_input": False,
+                "choices": [],
+                "subagents_count": 2,
+                "snippet": "Next command"
+            }):
+                events = self.bridge.check_for_session_events()
+                self.assertEqual(len(events), 0, "Intermediate progress must NOT generate notifications!")
+
+    def test_detect_choice_question(self):
+        sample = """
+Quale opzione preferisci?
+1. Opzione A
+2. Opzione B
+>
+"""
+        with patch.object(self.bridge, "discover_agy_sessions", return_value=[{"target": "0:9.1", "window_name": "Test", "cwd": "/tmp"}]):
+            self.bridge._last_content_hashes["0:9.1"] = "old_hash"
+            self.bridge._last_waiting_state["0:9.1"] = False
+            with patch.object(self.bridge, "inspect_pane", return_value={
+                "main_text": sample,
+                "is_waiting_input": True,
+                "choices": ["1. Opzione A", "2. Opzione B"],
+                "subagents_count": 1,
+                "snippet": "Quale opzione preferisci?"
+            }):
+                events = self.bridge.check_for_session_events()
+                self.assertEqual(len(events), 1)
+                self.assertEqual(events[0]["event_type"], "question")
+                self.assertEqual(len(events[0]["choices"]), 2)
+
+    def test_detect_task_completion(self):
+        sample = """
+Your Teamwork run has finished. All milestones verified and deliverables ready!
+"""
+        with patch.object(self.bridge, "discover_agy_sessions", return_value=[{"target": "0:9.1", "window_name": "Test", "cwd": "/tmp"}]):
+            self.bridge._last_content_hashes["0:9.1"] = "old_hash"
+            self.bridge._last_waiting_state["0:9.1"] = False
+            with patch.object(self.bridge, "inspect_pane", return_value={
+                "main_text": sample,
+                "is_waiting_input": True,
+                "choices": [],
+                "subagents_count": 0,
+                "snippet": "Your Teamwork run has finished."
+            }):
+                events = self.bridge.check_for_session_events()
+                self.assertEqual(len(events), 1)
+                self.assertEqual(events[0]["event_type"], "completed")
 
 
 if __name__ == "__main__":

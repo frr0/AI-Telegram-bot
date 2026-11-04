@@ -1651,22 +1651,29 @@ class BotApp:
                             body=ev["snippet"][:90],
                             is_question=True
                         )
-                    else:
-                        u_msg = (
-                            f"⚙️ *Avanzamento Agy in tmux:* `{w_name}`{sub_info}\n\n"
+                    elif ev["event_type"] == "completed":
+                        comp_msg = (
+                            f"🎉 *Richiesta Completata con Successo in tmux!*\n\n"
+                            f"• *Finestra:* `{w_name}` (`{t_target}`)\n"
+                            f"• *Cartella:* `{ev['cwd']}`\n\n"
                             f"```text\n{ev['snippet']}\n```"
                         )
                         kb_rows = [
-                            [{"text": f"👁️ Schermo Live: {w_name}", "callback_data": f"tmux:screen:{t_target}"}],
+                            [{"text": f"👁️ Schermo Finale: {w_name}", "callback_data": f"tmux:screen:{t_target}"}],
                             [{"text": "🖥️ Tutte le Sessioni", "callback_data": "menu:tmux"}]
                         ]
                         reply_kb = self.client.build_inline_keyboard(kb_rows)
                         await self.client.send_message(
                             target_chat,
-                            u_msg,
+                            comp_msg,
                             reply_markup=reply_kb,
                             parse_mode="Markdown",
                             disable_notification=False
+                        )
+                        self.notifier.trigger_local_alert(
+                            title=f"✅ Task Completato ({w_name})",
+                            body=ev["snippet"][:90],
+                            is_question=False
                         )
 
             except asyncio.CancelledError:
