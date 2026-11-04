@@ -204,6 +204,15 @@ class BotApp:
             dangerously_skip_permissions=self.config.dangerously_skip_permissions
         )
 
+        if self.history.get_current_turns():
+            self.engine.conversation_id = "continue"
+            last_turn = self.history.get_last_turn()
+            if last_turn and last_turn.get("response"):
+                q = QuestionParser.extract_question(last_turn["response"])
+                if q:
+                    for ch in q[1]:
+                        self.pending_choices[ch.index] = ch.value
+
         self.ui.print_banner(
             bot_username=bot_username,
             model=self.config.default_model,
@@ -571,6 +580,25 @@ class BotApp:
         self.is_processing = True
         target_chat = chat_id or self.last_chat_id
 
+        # Resolve fallback choice:X if received directly
+        if prompt.startswith("choice:"):
+            try:
+                c_idx = int(prompt.split(":", 1)[1])
+                val = self.pending_choices.get(c_idx)
+                if not val:
+                    last_turn = self.history.get_last_turn()
+                    if last_turn and last_turn.get("response"):
+                        q = QuestionParser.extract_question(last_turn["response"])
+                        if q:
+                            for ch in q[1]:
+                                if ch.index == c_idx:
+                                    val = ch.value
+                                    break
+                if val:
+                    prompt = val
+            except Exception:
+                pass
+
         # Clear any pending choices
         self.pending_choices.clear()
 
@@ -847,7 +875,18 @@ class BotApp:
             if data.startswith("choice:"):
                 try:
                     choice_idx = int(data.split(":", 1)[1])
-                    selected_val = self.pending_choices.get(choice_idx, data)
+                    selected_val = self.pending_choices.get(choice_idx)
+                    if not selected_val:
+                        last_turn = self.history.get_last_turn()
+                        if last_turn and last_turn.get("response"):
+                            q = QuestionParser.extract_question(last_turn["response"])
+                            if q:
+                                for ch in q[1]:
+                                    if ch.index == choice_idx:
+                                        selected_val = ch.value
+                                        break
+                    if not selected_val:
+                        selected_val = data
                 except ValueError:
                     selected_val = data
 
