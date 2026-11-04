@@ -12,6 +12,16 @@ from terminal_ui import TerminalUI
 from question_parser import QuestionParser, QuestionChoice
 from history_manager import HistoryManager
 from power_monitor import get_power_report
+from screen_manager import set_screen_power, lock_screen, unlock_screen
+from agy_manager import (
+    get_usage_report,
+    get_credits_report,
+    get_mcp_report,
+    get_skills_report,
+    get_agents_report,
+    get_effort_report,
+    get_workflow_help
+)
 
 # Setup basic logging
 logging.basicConfig(
@@ -39,8 +49,8 @@ class BotApp:
         return self.client.build_reply_keyboard([
             ["🛑 Stop", "➕ Nuova Chat"],
             ["📜 Cronologia", "📊 Stato"],
-            ["⚡ Consumi", "🧠 Modello"],
-            ["📋 Menu"]
+            ["⚡ Consumi", "🖥️ Schermo"],
+            ["🎛️ Opzioni Agy", "📋 Menu"]
         ], resize_keyboard=True, is_persistent=True)
 
     def get_inline_menu(self) -> Dict[str, Any]:
@@ -57,6 +67,49 @@ class BotApp:
             [
                 {"text": "⚡ Consumi", "callback_data": "menu:power"},
                 {"text": "🧠 Seleziona Modello", "callback_data": "menu:models"}
+            ],
+            [
+                {"text": "💤 Spegni Schermo", "callback_data": "menu:screen_off"},
+                {"text": "💡 Accendi Schermo", "callback_data": "menu:screen_on"}
+            ],
+            [
+                {"text": "🎛️ Tutte le Opzioni da Terminale Agy", "callback_data": "agy:menu"}
+            ]
+        ])
+
+    def get_agy_options_keyboard(self) -> Dict[str, Any]:
+        """Interactive inline keyboard with all Agy terminal options and workflows."""
+        return self.client.build_inline_keyboard([
+            [
+                {"text": "📊 Quota (Usage)", "callback_data": "agy:usage"},
+                {"text": "💳 Crediti G1", "callback_data": "agy:credits"}
+            ],
+            [
+                {"text": "🔌 Server MCP", "callback_data": "agy:mcp"},
+                {"text": "⚡ Skills", "callback_data": "agy:skills"}
+            ],
+            [
+                {"text": "👥 Teamwork", "callback_data": "agy:teamwork"},
+                {"text": "🎯 Goal Mode", "callback_data": "agy:goal"}
+            ],
+            [
+                {"text": "📝 Plan Mode", "callback_data": "agy:plan"},
+                {"text": "🚀 Boost Mode", "callback_data": "agy:boost"}
+            ],
+            [
+                {"text": "🌐 Browser Web", "callback_data": "agy:browser"},
+                {"text": "🗜️ Compact", "callback_data": "agy:compact"}
+            ],
+            [
+                {"text": "🧑‍🏫 Grill Me", "callback_data": "agy:grill_me"},
+                {"text": "💡 Learn", "callback_data": "agy:learn"}
+            ],
+            [
+                {"text": "⚙️ Reasoning Effort", "callback_data": "agy:effort"},
+                {"text": "🤖 Agenti", "callback_data": "agy:agents"}
+            ],
+            [
+                {"text": "🔙 Torna al Menu", "callback_data": "menu:main"}
             ]
         ])
 
@@ -109,6 +162,12 @@ class BotApp:
             {"command": "history", "description": "📜 Mostra la cronologia della chat"},
             {"command": "status", "description": "📊 Visualizza lo stato del bot"},
             {"command": "power", "description": "⚡ Visualizza i consumi energetici e costi (PC & RPi0W)"},
+            {"command": "screen", "description": "🖥️ Accendi o spegni lo schermo del PC (on / off)"},
+            {"command": "agy", "description": "🎛️ Opzioni e strumenti da terminale Agy (usage, mcp, teamwork, ecc)"},
+            {"command": "usage", "description": "📊 Quote di utilizzo e limiti modelli Agy"},
+            {"command": "credits", "description": "💳 Crediti G1 rimanenti"},
+            {"command": "mcp", "description": "🔌 Server MCP configurati e attivi"},
+            {"command": "skills", "description": "⚡ Skill disponibili in Antigravity"},
             {"command": "model", "description": "🧠 Visualizza o cambia il modello AI"}
         ]
         await self.client.set_my_commands(bot_commands)
@@ -235,6 +294,76 @@ class BotApp:
         else:
             self.ui.log_info(report.replace("*", "").replace("`", ""))
 
+    async def cmd_screen(self, arg: str = "", chat_id: Optional[int] = None):
+        """Controls PC monitor power state (DPMS on / off)."""
+        target_chat = chat_id or self.last_chat_id
+        arg_clean = arg.strip().lower()
+
+        if arg_clean in ["off", "0", "spento", "spegni"]:
+            success, msg = await asyncio.to_thread(set_screen_power, False)
+            if target_chat and self.client:
+                await self.client.send_message(
+                    target_chat,
+                    msg,
+                    reply_markup=self.get_reply_keyboard(),
+                    parse_mode="Markdown"
+                )
+            else:
+                self.ui.log_info(msg.replace("*", "").replace("`", ""))
+        elif arg_clean in ["on", "1", "acceso", "accendi"]:
+            success, msg = await asyncio.to_thread(set_screen_power, True)
+            if target_chat and self.client:
+                await self.client.send_message(
+                    target_chat,
+                    msg,
+                    reply_markup=self.get_reply_keyboard(),
+                    parse_mode="Markdown"
+                )
+            else:
+                self.ui.log_info(msg.replace("*", "").replace("`", ""))
+        elif arg_clean in ["unlock", "sblocca"]:
+            success, msg = await asyncio.to_thread(unlock_screen)
+            if target_chat and self.client:
+                await self.client.send_message(
+                    target_chat,
+                    msg,
+                    reply_markup=self.get_reply_keyboard(),
+                    parse_mode="Markdown"
+                )
+            else:
+                self.ui.log_info(msg.replace("*", "").replace("`", ""))
+        elif arg_clean in ["lock", "blocca"]:
+            success, msg = await asyncio.to_thread(lock_screen)
+            if target_chat and self.client:
+                await self.client.send_message(
+                    target_chat,
+                    msg,
+                    reply_markup=self.get_reply_keyboard(),
+                    parse_mode="Markdown"
+                )
+            else:
+                self.ui.log_info(msg.replace("*", "").replace("`", ""))
+        else:
+            kb = self.client.build_inline_keyboard([
+                [
+                    {"text": "💤 Spegni Schermo", "callback_data": "menu:screen_off"},
+                    {"text": "💡 Accendi Schermo", "callback_data": "menu:screen_on"}
+                ],
+                [
+                    {"text": "🔓 Sblocca Schermo", "callback_data": "menu:screen_unlock"},
+                    {"text": "🔒 Blocca Schermo", "callback_data": "menu:screen_lock"}
+                ]
+            ])
+            if target_chat and self.client:
+                await self.client.send_message(
+                    target_chat,
+                    "🖥️ *Controllo Schermo PC*\nScegli un'azione per il display del PC:",
+                    reply_markup=kb,
+                    parse_mode="Markdown"
+                )
+            else:
+                self.ui.log_info("Use: /screen on|off|lock|unlock")
+
     async def cmd_models(self, chat_id: Optional[int] = None):
         """Displays model switcher."""
         target_chat = chat_id or self.last_chat_id
@@ -260,6 +389,134 @@ class BotApp:
                 reply_markup=self.get_inline_menu(),
                 parse_mode="Markdown"
             )
+
+    async def cmd_agy_options(self, chat_id: Optional[int] = None, message_id: Optional[int] = None):
+        """Displays the full Agy terminal options and workflows panel."""
+        target_chat = chat_id or self.last_chat_id
+        text = (
+            "🎛️ *Opzioni e Strumenti da Terminale Antigravity (Agy)*\n\n"
+            "Seleziona un'opzione per visualizzare statistiche in tempo reale o scoprire come usare i workflow avanzati:"
+        )
+        kb = self.get_agy_options_keyboard()
+        if target_chat and self.client:
+            if message_id:
+                await self.client.edit_message_text(chat_id=target_chat, message_id=message_id, text=text, reply_markup=kb, parse_mode="Markdown")
+            else:
+                await self.client.send_message(target_chat, text, reply_markup=kb, parse_mode="Markdown")
+        else:
+            self.ui.log_info("Agy options available via Telegram or /help")
+
+    async def cmd_usage(self, chat_id: Optional[int] = None, message_id: Optional[int] = None):
+        """Fetches and displays model quota from agy."""
+        target_chat = chat_id or self.last_chat_id
+        report = await asyncio.to_thread(get_usage_report)
+        kb = self.client.build_inline_keyboard([
+            [{"text": "🔄 Aggiorna Quota", "callback_data": "agy:usage"}],
+            [{"text": "🔙 Tutte le Opzioni Agy", "callback_data": "agy:menu"}]
+        ]) if self.client else None
+        if target_chat and self.client:
+            if message_id:
+                await self.client.edit_message_text(chat_id=target_chat, message_id=message_id, text=report, reply_markup=kb, parse_mode="Markdown")
+            else:
+                await self.client.send_message(target_chat, report, reply_markup=kb, parse_mode="Markdown")
+        else:
+            self.ui.log_info(report.replace("*", "").replace("`", ""))
+
+    async def cmd_credits(self, chat_id: Optional[int] = None, message_id: Optional[int] = None):
+        """Fetches and displays G1 credits."""
+        target_chat = chat_id or self.last_chat_id
+        report = await asyncio.to_thread(get_credits_report)
+        kb = self.client.build_inline_keyboard([
+            [{"text": "🔄 Aggiorna", "callback_data": "agy:credits"}],
+            [{"text": "🔙 Tutte le Opzioni Agy", "callback_data": "agy:menu"}]
+        ]) if self.client else None
+        if target_chat and self.client:
+            if message_id:
+                await self.client.edit_message_text(chat_id=target_chat, message_id=message_id, text=report, reply_markup=kb, parse_mode="Markdown")
+            else:
+                await self.client.send_message(target_chat, report, reply_markup=kb, parse_mode="Markdown")
+        else:
+            self.ui.log_info(report.replace("*", "").replace("`", ""))
+
+    async def cmd_mcp(self, chat_id: Optional[int] = None, message_id: Optional[int] = None):
+        """Fetches and displays MCP servers."""
+        target_chat = chat_id or self.last_chat_id
+        report = await asyncio.to_thread(get_mcp_report)
+        kb = self.client.build_inline_keyboard([
+            [{"text": "🔄 Aggiorna Server MCP", "callback_data": "agy:mcp"}],
+            [{"text": "🔙 Tutte le Opzioni Agy", "callback_data": "agy:menu"}]
+        ]) if self.client else None
+        if target_chat and self.client:
+            if message_id:
+                await self.client.edit_message_text(chat_id=target_chat, message_id=message_id, text=report, reply_markup=kb, parse_mode="Markdown")
+            else:
+                await self.client.send_message(target_chat, report, reply_markup=kb, parse_mode="Markdown")
+        else:
+            self.ui.log_info(report.replace("*", "").replace("`", ""))
+
+    async def cmd_skills(self, chat_id: Optional[int] = None, message_id: Optional[int] = None):
+        """Fetches and displays available skills."""
+        target_chat = chat_id or self.last_chat_id
+        report = await asyncio.to_thread(get_skills_report)
+        kb = self.client.build_inline_keyboard([
+            [{"text": "🔄 Aggiorna Skills", "callback_data": "agy:skills"}],
+            [{"text": "🔙 Tutte le Opzioni Agy", "callback_data": "agy:menu"}]
+        ]) if self.client else None
+        if target_chat and self.client:
+            if message_id:
+                await self.client.edit_message_text(chat_id=target_chat, message_id=message_id, text=report, reply_markup=kb, parse_mode="Markdown")
+            else:
+                await self.client.send_message(target_chat, report, reply_markup=kb, parse_mode="Markdown")
+        else:
+            self.ui.log_info(report.replace("*", "").replace("`", ""))
+
+    async def cmd_agents(self, chat_id: Optional[int] = None, message_id: Optional[int] = None):
+        """Fetches and displays available custom agents."""
+        target_chat = chat_id or self.last_chat_id
+        report = await asyncio.to_thread(get_agents_report)
+        kb = self.client.build_inline_keyboard([
+            [{"text": "🔄 Aggiorna", "callback_data": "agy:agents"}],
+            [{"text": "🔙 Tutte le Opzioni Agy", "callback_data": "agy:menu"}]
+        ]) if self.client else None
+        if target_chat and self.client:
+            if message_id:
+                await self.client.edit_message_text(chat_id=target_chat, message_id=message_id, text=report, reply_markup=kb, parse_mode="Markdown")
+            else:
+                await self.client.send_message(target_chat, report, reply_markup=kb, parse_mode="Markdown")
+        else:
+            self.ui.log_info(report.replace("*", "").replace("`", ""))
+
+    async def cmd_effort(self, chat_id: Optional[int] = None, message_id: Optional[int] = None):
+        """Fetches and displays reasoning effort."""
+        target_chat = chat_id or self.last_chat_id
+        report = await asyncio.to_thread(get_effort_report)
+        kb = self.client.build_inline_keyboard([
+            [{"text": "🔙 Tutte le Opzioni Agy", "callback_data": "agy:menu"}]
+        ]) if self.client else None
+        if target_chat and self.client:
+            if message_id:
+                await self.client.edit_message_text(chat_id=target_chat, message_id=message_id, text=report, reply_markup=kb, parse_mode="Markdown")
+            else:
+                await self.client.send_message(target_chat, report, reply_markup=kb, parse_mode="Markdown")
+        else:
+            self.ui.log_info(report.replace("*", "").replace("`", ""))
+
+    async def cmd_workflow(self, mode: str, chat_id: Optional[int] = None, message_id: Optional[int] = None):
+        """Displays explanation and actions for slash command workflows."""
+        target_chat = chat_id or self.last_chat_id
+        report = get_workflow_help(mode)
+        buttons = []
+        if mode == "compact":
+            buttons.append([{"text": "🗜️ Esegui Compact Ora", "callback_data": "agy:run:compact"}])
+        buttons.append([{"text": "🔙 Tutte le Opzioni Agy", "callback_data": "agy:menu"}])
+        kb = self.client.build_inline_keyboard(buttons) if self.client else None
+        if target_chat and self.client:
+            if message_id:
+                await self.client.edit_message_text(chat_id=target_chat, message_id=message_id, text=report, reply_markup=kb, parse_mode="Markdown")
+            else:
+                await self.client.send_message(target_chat, report, reply_markup=kb, parse_mode="Markdown")
+        else:
+            self.ui.log_info(report.replace("*", "").replace("`", ""))
 
     # --- Prompt handling ---
 
@@ -394,6 +651,27 @@ class BotApp:
             elif cmd in ["/power", "/consumi"]:
                 await self.cmd_power()
                 return
+            elif cmd in ["/screen", "/schermo"]:
+                await self.cmd_screen(arg)
+                return
+            elif cmd in ["/usage", "/quota"]:
+                await self.cmd_usage()
+                return
+            elif cmd in ["/credits", "/crediti"]:
+                await self.cmd_credits()
+                return
+            elif cmd == "/mcp":
+                await self.cmd_mcp()
+                return
+            elif cmd == "/skills":
+                await self.cmd_skills()
+                return
+            elif cmd == "/agents":
+                await self.cmd_agents()
+                return
+            elif cmd == "/effort":
+                await self.cmd_effort()
+                return
             elif cmd in ["/model", "/modello"]:
                 if arg:
                     norm = normalize_model_name(arg)
@@ -407,7 +685,13 @@ class BotApp:
             elif cmd == "/help":
                 print("Available commands:")
                 print("  /status      - Mostra lo stato del bot")
+                print("  /usage       - Mostra le quote di utilizzo e limiti modelli Agy")
+                print("  /credits     - Mostra i crediti G1 rimanenti")
+                print("  /mcp         - Elenca i server MCP attivi")
+                print("  /skills      - Elenca le skill Antigravity disponibili")
+                print("  /effort      - Mostra il livello di reasoning effort")
                 print("  /power       - Mostra consumi energetici e costi stimati (PC & RPi0W)")
+                print("  /screen <on|off> - Accendi o spegni lo schermo del PC")
                 print("  /new         - Resetta e avvia una nuova sessione")
                 print("  /history     - Mostra la cronologia della sessione")
                 print("  /stop        - Ferma l'attività in corso")
@@ -524,11 +808,138 @@ class BotApp:
             elif data == "menu:power":
                 await self.cmd_power(chat_id)
                 return
+            elif data == "menu:screen_off":
+                success, screen_msg = await asyncio.to_thread(set_screen_power, False)
+                if msg.get("message_id"):
+                    await self.client.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=msg["message_id"],
+                        text=f"{screen_msg}\n\nUsa i pulsanti per riaccenderlo:",
+                        reply_markup=self.client.build_inline_keyboard([
+                            [{"text": "💡 Accendi Schermo", "callback_data": "menu:screen_on"}],
+                            [{"text": "🔙 Torna al Menu", "callback_data": "menu:main"}]
+                        ]),
+                        parse_mode="Markdown"
+                    )
+                else:
+                    await self.client.send_message(
+                        chat_id,
+                        screen_msg,
+                        reply_markup=self.get_reply_keyboard(),
+                        parse_mode="Markdown"
+                    )
+                return
+            elif data == "menu:screen_on":
+                success, screen_msg = await asyncio.to_thread(set_screen_power, True)
+                if msg.get("message_id"):
+                    await self.client.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=msg["message_id"],
+                        text=f"{screen_msg}\n\nUsa i pulsanti per spegnerlo:",
+                        reply_markup=self.client.build_inline_keyboard([
+                            [{"text": "💤 Spegni Schermo", "callback_data": "menu:screen_off"}],
+                            [{"text": "🔙 Torna al Menu", "callback_data": "menu:main"}]
+                        ]),
+                        parse_mode="Markdown"
+                    )
+                else:
+                    await self.client.send_message(
+                        chat_id,
+                        screen_msg,
+                        reply_markup=self.get_reply_keyboard(),
+                        parse_mode="Markdown"
+                    )
+                return
+            elif data == "menu:screen_unlock":
+                success, screen_msg = await asyncio.to_thread(unlock_screen)
+                if msg.get("message_id"):
+                    await self.client.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=msg["message_id"],
+                        text=screen_msg,
+                        reply_markup=self.client.build_inline_keyboard([
+                            [{"text": "🔒 Blocca Schermo", "callback_data": "menu:screen_lock"}],
+                            [{"text": "🔙 Torna al Menu", "callback_data": "menu:main"}]
+                        ]),
+                        parse_mode="Markdown"
+                    )
+                else:
+                    await self.client.send_message(
+                        chat_id,
+                        screen_msg,
+                        reply_markup=self.get_reply_keyboard(),
+                        parse_mode="Markdown"
+                    )
+                return
+            elif data == "menu:screen_lock":
+                success, screen_msg = await asyncio.to_thread(lock_screen)
+                if msg.get("message_id"):
+                    await self.client.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=msg["message_id"],
+                        text=screen_msg,
+                        reply_markup=self.client.build_inline_keyboard([
+                            [{"text": "🔓 Sblocca Schermo", "callback_data": "menu:screen_unlock"}],
+                            [{"text": "🔙 Torna al Menu", "callback_data": "menu:main"}]
+                        ]),
+                        parse_mode="Markdown"
+                    )
+                else:
+                    await self.client.send_message(
+                        chat_id,
+                        screen_msg,
+                        reply_markup=self.get_reply_keyboard(),
+                        parse_mode="Markdown"
+                    )
+                return
             elif data == "menu:models":
                 await self.cmd_models(chat_id)
                 return
             elif data == "menu:main":
-                await self.cmd_menu(chat_id)
+                if msg.get("message_id"):
+                    await self.client.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=msg["message_id"],
+                        text="📋 *Pannello di Controllo Antigravity*\n\nUsa i pulsanti interattivi qui sotto:",
+                        reply_markup=self.get_inline_menu(),
+                        parse_mode="Markdown"
+                    )
+                else:
+                    await self.cmd_menu(chat_id)
+                return
+
+            # E. Agy Terminal Options & Workflows
+            if data == "agy:menu":
+                await self.cmd_agy_options(chat_id, message_id=msg.get("message_id"))
+                return
+            elif data == "agy:usage":
+                await self.cmd_usage(chat_id, message_id=msg.get("message_id"))
+                return
+            elif data == "agy:credits":
+                await self.cmd_credits(chat_id, message_id=msg.get("message_id"))
+                return
+            elif data == "agy:mcp":
+                await self.cmd_mcp(chat_id, message_id=msg.get("message_id"))
+                return
+            elif data == "agy:skills":
+                await self.cmd_skills(chat_id, message_id=msg.get("message_id"))
+                return
+            elif data == "agy:agents":
+                await self.cmd_agents(chat_id, message_id=msg.get("message_id"))
+                return
+            elif data == "agy:effort":
+                await self.cmd_effort(chat_id, message_id=msg.get("message_id"))
+                return
+            elif data.startswith("agy:run:"):
+                run_action = data.split(":", 2)[2]
+                if run_action == "compact":
+                    await self.handle_prompt("/compact", source="telegram", chat_id=chat_id)
+                else:
+                    await self.handle_prompt(f"/{run_action}", source="telegram", chat_id=chat_id)
+                return
+            elif data.startswith("agy:"):
+                workflow_mode = data.split(":", 1)[1]
+                await self.cmd_workflow(workflow_mode, chat_id, message_id=msg.get("message_id"))
                 return
 
             # C. Model selection
@@ -642,6 +1053,20 @@ class BotApp:
                 await self.cmd_power(chat_id)
                 return
 
+            if text_lower.startswith(("/screen", "/schermo", "screen", "schermo", "🖥️ schermo", "🖥️ screen")) or text_lower in ["🖥️ schermo", "schermo", "screen"]:
+                parts = text.split(maxsplit=1)
+                arg_val = parts[1] if len(parts) > 1 and not parts[0].startswith("🖥️") else ""
+                await self.cmd_screen(arg_val, chat_id)
+                return
+
+            if text_lower in ["/unlock", "/sblocca", "sblocca", "unlock"]:
+                await self.cmd_screen("unlock", chat_id)
+                return
+
+            if text_lower in ["/lock", "/blocca", "blocca", "lock"]:
+                await self.cmd_screen("lock", chat_id)
+                return
+
             if text_lower in ["🧠 modello", "modello", "model", "/model"]:
                 if text_lower.startswith("/model") and len(text.split(maxsplit=1)) > 1:
                     new_model = text.split(maxsplit=1)[1].strip()
@@ -664,6 +1089,66 @@ class BotApp:
                 await self.cmd_menu(chat_id)
                 return
 
+            if text_lower in ["🎛️ opzioni agy", "opzioni agy", "opzioni", "/agy", "/opzioni", "/tools", "agy"]:
+                await self.cmd_agy_options(chat_id)
+                return
+
+            if text_lower in ["/usage", "/quota", "usage", "quota"]:
+                await self.cmd_usage(chat_id)
+                return
+
+            if text_lower in ["/credits", "credits", "crediti", "/crediti"]:
+                await self.cmd_credits(chat_id)
+                return
+
+            if text_lower in ["/mcp", "mcp"]:
+                await self.cmd_mcp(chat_id)
+                return
+
+            if text_lower in ["/skills", "skills"]:
+                await self.cmd_skills(chat_id)
+                return
+
+            if text_lower in ["/agents", "agents", "agenti", "/agenti"]:
+                await self.cmd_agents(chat_id)
+                return
+
+            if text_lower in ["/effort", "effort"]:
+                await self.cmd_effort(chat_id)
+                return
+
+            if text_lower in ["/teamwork", "teamwork"]:
+                await self.cmd_workflow("teamwork", chat_id)
+                return
+
+            if text_lower in ["/goal", "goal"]:
+                await self.cmd_workflow("goal", chat_id)
+                return
+
+            if text_lower in ["/plan", "plan"]:
+                await self.cmd_workflow("plan", chat_id)
+                return
+
+            if text_lower in ["/boost", "boost"]:
+                await self.cmd_workflow("boost", chat_id)
+                return
+
+            if text_lower in ["/browser", "browser"]:
+                await self.cmd_workflow("browser", chat_id)
+                return
+
+            if text_lower in ["/compact", "compact"]:
+                await self.handle_prompt("/compact", source="telegram", chat_id=chat_id)
+                return
+
+            if text_lower in ["/grill-me", "/grill_me", "grill-me", "grill me"]:
+                await self.cmd_workflow("grill_me", chat_id)
+                return
+
+            if text_lower in ["/learn", "learn"]:
+                await self.cmd_workflow("learn", chat_id)
+                return
+
             if text_lower in ["/help", "help", "aiuto"]:
                 help_msg = (
                     "ℹ️ *Guida Comandi Antigravity*\n\n"
@@ -672,6 +1157,12 @@ class BotApp:
                     "• *📜 Cronologia:* Mostra i messaggi e turni della sessione corrente\n"
                     "• *📊 Stato:* Informazioni sul modello attivo e cartella di lavoro\n"
                     "• *⚡ Consumi:* Visualizza consumi in Watt/h, tempo di attività e costi stimati\n"
+                    "• *🖥️ Schermo:* `/screen on` o `/screen off` per accendere o spegnere il display del PC\n"
+                    "• *🎛️ Opzioni Agy:* Menu interattivo con tutte le opzioni da terminale (Usage, Credits, MCP, Skills)\n"
+                    "• *📊 /usage:* Mostra le quote residue settimanali e su 5 ore di tutti i modelli\n"
+                    "• *💳 /credits:* Crediti G1 rimanenti\n"
+                    "• *🔌 /mcp:* Elenco dei server MCP attivi e configurati\n"
+                    "• *⚡ /skills:* Elenco skill disponibili\n"
                     "• *🧠 Modello:* Menu interattivo per cambiare modello AI\n"
                     "• *📋 Menu:* Visualizza il pannello comandi inline"
                 )
