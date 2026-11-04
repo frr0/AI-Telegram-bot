@@ -3,6 +3,7 @@ import fcntl
 import logging
 import signal
 import sys
+import time
 from typing import Optional, Dict, List, Any
 
 from config import Config
@@ -13,6 +14,11 @@ from question_parser import QuestionParser, QuestionChoice
 from history_manager import HistoryManager
 from power_monitor import get_power_report
 from screen_manager import set_screen_power, lock_screen, unlock_screen
+from notification_manager import (
+    NotificationManager,
+    build_completion_header,
+    format_duration
+)
 from agy_manager import (
     get_usage_report,
     get_credits_report,
@@ -38,6 +44,7 @@ class BotApp:
         self.client: Optional[TelegramClient] = None
         self.engine: Optional[AgyEngine] = None
         self.history = HistoryManager()
+        self.notifier = NotificationManager()
 
         self.last_chat_id: Optional[int] = None
         self.pending_choices: Dict[int, str] = {} # choice_index -> choice_value
@@ -73,7 +80,24 @@ class BotApp:
                 {"text": "💡 Accendi Schermo", "callback_data": "menu:screen_on"}
             ],
             [
+                {"text": "🔔 Impostazioni Notifiche", "callback_data": "menu:notifications"}
+            ],
+            [
                 {"text": "🎛️ Tutte le Opzioni da Terminale Agy", "callback_data": "agy:menu"}
+            ]
+        ])
+
+    def get_notification_keyboard(self) -> Dict[str, Any]:
+        """Interactive inline keyboard for desktop and audio notifications."""
+        sound_status = "🔊 Suono: ON" if self.notifier.sound_alerts else "🔇 Suono: OFF"
+        desktop_status = "🖥️ Desktop: ON" if self.notifier.desktop_notifications else "⚪ Desktop: OFF"
+        return self.client.build_inline_keyboard([
+            [
+                {"text": desktop_status, "callback_data": "notify:toggle_desktop"},
+                {"text": sound_status, "callback_data": "notify:toggle_sound"}
+            ],
+            [
+                {"text": "🔙 Torna al Menu", "callback_data": "menu:main"}
             ]
         ])
 
@@ -163,6 +187,7 @@ class BotApp:
             {"command": "status", "description": "📊 Visualizza lo stato del bot"},
             {"command": "power", "description": "⚡ Visualizza i consumi energetici e costi (PC & RPi0W)"},
             {"command": "screen", "description": "🖥️ Accendi o spegni lo schermo del PC (on / off)"},
+            {"command": "notify", "description": "🔔 Gestisci notifiche push e avvisi sonori/desktop"},
             {"command": "agy", "description": "🎛️ Opzioni e strumenti da terminale Agy (usage, mcp, teamwork, ecc)"},
             {"command": "usage", "description": "📊 Quote di utilizzo e limiti modelli Agy"},
             {"command": "credits", "description": "💳 Crediti G1 rimanenti"},
@@ -390,6 +415,19 @@ class BotApp:
                 parse_mode="Markdown"
             )
 
+    async def cmd_notify(self, chat_id: Optional[int] = None, message_id: Optional[int] = None):
+        """Displays and configures notification settings."""
+        target_chat = chat_id or self.last_chat_id
+        text = self.notifier.get_status_report()
+        kb = self.get_notification_keyboard() if self.client else None
+        if target_chat and self.client:
+            if message_id:
+                await self.client.edit_message_text(chat_id=target_chat, message_id=message_id, text=text, reply_markup=kb, parse_mode="Markdown")
+            else:
+                await self.client.send_message(target_chat, text, reply_markup=kb, parse_mode="Markdown")
+        else:
+            self.ui.log_info(text.replace("*", ""))
+
     async def cmd_agy_options(self, chat_id: Optional[int] = None, message_id: Optional[int] = None):
         """Displays the full Agy terminal options and workflows panel."""
         target_chat = chat_id or self.last_chat_id
@@ -545,9 +583,11 @@ class BotApp:
                     await asyncio.sleep(4)
             typing_task = asyncio.create_task(keep_typing())
 
+        start_time = time.time()
         try:
             self.ui.log_info(f"Dispatching task to Antigravity ({self.engine.model})...")
             exit_code, output = await self.engine.execute_turn(prompt)
+            elapsed = time.time() - start_time
 
             if typing_task:
                 typing_task.cancel()
@@ -562,6 +602,29 @@ class BotApp:
 
             # Check if output contains a multiple-choice question
             question_data = QuestionParser.extract_question(output)
+            is_question = bool(question_data)
+            success = (exit_code == 0)
+
+            # Push notification header
+            push_header = build_completion_header(
+                success=success,
+                elapsed=elapsed,
+                is_question=is_question,
+                model=self.engine.model
+            )
+
+            # Trigger local desktop notification and chime
+            title = "🔔 Antigravity: Domanda in attesa!" if is_question else (
+                "✅ Antigravity: Task Completato" if success else "❌ Antigravity: Task Fallito"
+            )
+            first_line = output.split("\n", 1)[0]
+            summary_preview = (first_line[:90] + "...") if len(first_line) > 90 else first_line
+            self.notifier.trigger_local_alert(
+                title=title,
+                body=f"⏱️ {format_duration(elapsed)} • {summary_preview}",
+                is_question=is_question,
+                urgency="critical" if is_question else "normal"
+            )
 
             if question_data:
                 question_text, choices = question_data
@@ -581,37 +644,47 @@ class BotApp:
                         }])
                     reply_markup = self.client.build_inline_keyboard(keyboard_rows)
 
-                    # Send main output + question with buttons
+                    # Send push notification header + question with buttons
                     await self.client.send_message(
                         target_chat,
-                        f"{output}\n\n❓ *Question:* {question_text}",
+                        f"{push_header}\n\n{output}\n\n❓ *Question:* {question_text}",
                         reply_markup=reply_markup,
-                        parse_mode="Markdown"
+                        parse_mode="Markdown",
+                        disable_notification=False
                     )
             else:
                 if target_chat and self.client:
                     await self.client.send_message(
                         target_chat,
-                        output,
+                        f"{push_header}\n\n{output}",
                         reply_markup=self.get_reply_keyboard(),
-                        parse_mode="Markdown"
+                        parse_mode="Markdown",
+                        disable_notification=False
                     )
 
         except asyncio.CancelledError:
             self.ui.log_warn("Task cancelled.")
+            elapsed = time.time() - start_time
             if target_chat and self.client:
+                header = build_completion_header(success=False, elapsed=elapsed, model=self.engine.model)
                 await self.client.send_message(
                     target_chat,
-                    "🛑 Attività annullata.",
-                    reply_markup=self.get_reply_keyboard()
+                    f"{header}\n\n🛑 Attività annullata.",
+                    reply_markup=self.get_reply_keyboard(),
+                    parse_mode="Markdown",
+                    disable_notification=False
                 )
         except Exception as e:
             self.ui.log_error(f"Error handling prompt: {e}")
+            elapsed = time.time() - start_time
             if target_chat and self.client:
+                header = build_completion_header(success=False, elapsed=elapsed, model=self.engine.model)
                 await self.client.send_message(
                     target_chat,
-                    f"❌ Errore: {e}",
-                    reply_markup=self.get_reply_keyboard()
+                    f"{header}\n\n❌ Errore: {e}",
+                    reply_markup=self.get_reply_keyboard(),
+                    parse_mode="Markdown",
+                    disable_notification=False
                 )
         finally:
             self.is_processing = False
@@ -654,6 +727,9 @@ class BotApp:
             elif cmd in ["/screen", "/schermo"]:
                 await self.cmd_screen(arg)
                 return
+            elif cmd in ["/notify", "/notifiche"]:
+                await self.cmd_notify()
+                return
             elif cmd in ["/usage", "/quota"]:
                 await self.cmd_usage()
                 return
@@ -692,6 +768,7 @@ class BotApp:
                 print("  /effort      - Mostra il livello di reasoning effort")
                 print("  /power       - Mostra consumi energetici e costi stimati (PC & RPi0W)")
                 print("  /screen <on|off> - Accendi o spegni lo schermo del PC")
+                print("  /notify      - Gestisci notifiche push e avvisi sonori/desktop")
                 print("  /new         - Resetta e avvia una nuova sessione")
                 print("  /history     - Mostra la cronologia della sessione")
                 print("  /stop        - Ferma l'attività in corso")
@@ -895,6 +972,17 @@ class BotApp:
             elif data == "menu:models":
                 await self.cmd_models(chat_id)
                 return
+            elif data == "menu:notifications":
+                await self.cmd_notify(chat_id, message_id=msg.get("message_id"))
+                return
+            elif data == "notify:toggle_desktop":
+                self.notifier.toggle_desktop()
+                await self.cmd_notify(chat_id, message_id=msg.get("message_id"))
+                return
+            elif data == "notify:toggle_sound":
+                self.notifier.toggle_sound()
+                await self.cmd_notify(chat_id, message_id=msg.get("message_id"))
+                return
             elif data == "menu:main":
                 if msg.get("message_id"):
                     await self.client.edit_message_text(
@@ -1089,6 +1177,10 @@ class BotApp:
                 await self.cmd_menu(chat_id)
                 return
 
+            if text_lower in ["/notify", "/notifiche", "notifiche", "🔔 notifiche", "notifica"]:
+                await self.cmd_notify(chat_id)
+                return
+
             if text_lower in ["🎛️ opzioni agy", "opzioni agy", "opzioni", "/agy", "/opzioni", "/tools", "agy"]:
                 await self.cmd_agy_options(chat_id)
                 return
@@ -1158,6 +1250,7 @@ class BotApp:
                     "• *📊 Stato:* Informazioni sul modello attivo e cartella di lavoro\n"
                     "• *⚡ Consumi:* Visualizza consumi in Watt/h, tempo di attività e costi stimati\n"
                     "• *🖥️ Schermo:* `/screen on` o `/screen off` per accendere o spegnere il display del PC\n"
+                    "• *🔔 Notifiche:* `/notify` per gestire pop-up desktop Linux, avvisi sonori e push Telegram\n"
                     "• *🎛️ Opzioni Agy:* Menu interattivo con tutte le opzioni da terminale (Usage, Credits, MCP, Skills)\n"
                     "• *📊 /usage:* Mostra le quote residue settimanali e su 5 ore di tutti i modelli\n"
                     "• *💳 /credits:* Crediti G1 rimanenti\n"

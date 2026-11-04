@@ -57,7 +57,8 @@ class TelegramClient:
         chat_id: Union[int, str],
         text: str,
         reply_markup: Optional[Dict[str, Any]] = None,
-        parse_mode: Optional[str] = "Markdown"
+        parse_mode: Optional[str] = "Markdown",
+        disable_notification: bool = False
     ) -> Optional[Dict[str, Any]]:
         if not text:
             return None
@@ -70,22 +71,25 @@ class TelegramClient:
             for idx, chunk in enumerate(chunks):
                 # Only attach reply_markup to the final chunk
                 markup = reply_markup if idx == len(chunks) - 1 else None
-                last_res = await self._send_chunk(chat_id, chunk, markup, parse_mode)
+                last_res = await self._send_chunk(chat_id, chunk, markup, parse_mode, disable_notification)
             return last_res
         else:
-            return await self._send_chunk(chat_id, text, reply_markup, parse_mode)
+            return await self._send_chunk(chat_id, text, reply_markup, parse_mode, disable_notification)
 
     async def _send_chunk(
         self,
         chat_id: Union[int, str],
         text: str,
         reply_markup: Optional[Dict[str, Any]] = None,
-        parse_mode: Optional[str] = "Markdown"
+        parse_mode: Optional[str] = "Markdown",
+        disable_notification: bool = False
     ) -> Optional[Dict[str, Any]]:
         params: Dict[str, Any] = {
             "chat_id": chat_id,
             "text": text,
         }
+        if disable_notification:
+            params["disable_notification"] = True
         if reply_markup:
             params["reply_markup"] = reply_markup
         if parse_mode:
