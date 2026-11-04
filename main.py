@@ -17,6 +17,7 @@ from screen_manager import set_screen_power, lock_screen, unlock_screen
 from media_manager import MediaManager
 from hardware_monitor import HardwareMonitor
 from teamwork_monitor import TeamworkMonitor
+from tmux_bridge import TmuxBridge
 from notification_manager import (
     NotificationManager,
     build_completion_header,
@@ -51,6 +52,7 @@ class BotApp:
         self.media = MediaManager()
         self.hw = HardwareMonitor()
         self.news_monitor = TeamworkMonitor()
+        self.tmux = TmuxBridge()
 
         self.last_chat_id: Optional[int] = None
         self.pending_choices: Dict[int, str] = {} # choice_index -> choice_value
@@ -64,8 +66,8 @@ class BotApp:
             ["🛑 Stop", "➕ Nuova Chat"],
             ["📜 Cronologia", "📊 Hardware"],
             ["⚡ Consumi", "🖥️ Schermo"],
-            ["🎵 Media", "🎛️ Opzioni Agy"],
-            ["📋 Menu", "📊 Stato"]
+            ["🎵 Media", "🖥️ Tmux Agy"],
+            ["🎛️ Opzioni Agy", "📋 Menu"]
         ], resize_keyboard=True, is_persistent=True)
 
     def get_inline_menu(self) -> Dict[str, Any]:
@@ -84,6 +86,10 @@ class BotApp:
                 {"text": "📊 Monitor Hardware", "callback_data": "menu:hardware"}
             ],
             [
+                {"text": "🖥️ Sessioni Agy su tmux", "callback_data": "menu:tmux"},
+                {"text": "📰 Teamwork News", "callback_data": "menu:news"}
+            ],
+            [
                 {"text": "⚡ Consumi", "callback_data": "menu:power"},
                 {"text": "🧠 Seleziona Modello", "callback_data": "menu:models"}
             ],
@@ -92,8 +98,7 @@ class BotApp:
                 {"text": "💡 Accendi Schermo", "callback_data": "menu:screen_on"}
             ],
             [
-                {"text": "🔔 Impostazioni Notifiche", "callback_data": "menu:notifications"},
-                {"text": "📰 Teamwork News", "callback_data": "menu:news"}
+                {"text": "🔔 Impostazioni Notifiche", "callback_data": "menu:notifications"}
             ],
             [
                 {"text": "🎛️ Tutte le Opzioni da Terminale Agy", "callback_data": "agy:menu"}
@@ -230,6 +235,8 @@ class BotApp:
             {"command": "screen", "description": "🖥️ Accendi o spegni lo schermo del PC (on / off)"},
             {"command": "media", "description": "🎵 Controlli multimediali e volume PC"},
             {"command": "hardware", "description": "📊 Monitor risorse hardware in tempo reale (CPU, RAM, Disco, Temp)"},
+            {"command": "tmux", "description": "🖥️ Visualizza e interagisci con le sessioni Agy in tmux"},
+            {"command": "send", "description": "✍️ Invia un input a una sessione tmux (/send <finestra> <testo>)"},
             {"command": "news", "description": "📰 Monitor del team di agenti in ~/Progetti/News"},
             {"command": "notify", "description": "🔔 Gestisci notifiche push e avvisi sonori/desktop"},
             {"command": "agy", "description": "🎛️ Opzioni e strumenti da terminale Agy (usage, mcp, teamwork, ecc)"},
@@ -522,6 +529,77 @@ class BotApp:
                 await self.client.send_message(target_chat, text=report, reply_markup=kb, parse_mode="Markdown")
         else:
             self.ui.log_info(report.replace("*", "").replace("`", ""))
+
+    async def cmd_tmux(self, chat_id: Optional[int] = None, message_id: Optional[int] = None):
+        """Displays all running agy sessions in tmux with action buttons."""
+        target_chat = chat_id or self.last_chat_id
+        report = await asyncio.to_thread(self.tmux.format_sessions_card)
+        sessions = await asyncio.to_thread(self.tmux.discover_agy_sessions)
+
+        keyboard_rows = []
+        for s in sessions:
+            w_name = s["window_name"]
+            target = s["target"]
+            keyboard_rows.append([
+                {"text": f"👁️ Schermo: {w_name}", "callback_data": f"tmux:screen:{target}"},
+                {"text": f"✍️ Invia Input: {w_name}", "callback_data": f"tmux:prompt:{target}"}
+            ])
+        keyboard_rows.append([
+            {"text": "🔄 Aggiorna Sessioni", "callback_data": "tmux:refresh"},
+            {"text": "🔙 Torna al Menu", "callback_data": "menu:main"}
+        ])
+        kb = self.client.build_inline_keyboard(keyboard_rows) if self.client else None
+
+        if target_chat and self.client:
+            if message_id:
+                await self.client.edit_message_text(chat_id=target_chat, message_id=message_id, text=report, reply_markup=kb, parse_mode="Markdown")
+            else:
+                await self.client.send_message(target_chat, text=report, reply_markup=kb, parse_mode="Markdown")
+        else:
+            self.ui.log_info(report.replace("*", "").replace("`", ""))
+
+    async def cmd_tmux_screen(self, target: str, chat_id: Optional[int] = None):
+        """Captures recent lines of a tmux pane and sends it as formatted code block."""
+        target_chat = chat_id or self.last_chat_id
+        screen = await asyncio.to_thread(self.tmux.capture_session_screen, target, 25)
+        text = f"🖥️ *Live Screen tmux (`{target}`):*\n```text\n{screen}\n```"
+        kb = self.client.build_inline_keyboard([
+            [{"text": "🔄 Aggiorna Schermo", "callback_data": f"tmux:screen:{target}"}],
+            [{"text": "🔙 Tutte le Sessioni", "callback_data": "menu:tmux"}]
+        ]) if self.client else None
+        if target_chat and self.client:
+            await self.client.send_message(target_chat, text, reply_markup=kb, parse_mode="Markdown")
+        else:
+            self.ui.log_info(screen)
+
+    async def cmd_send(self, args: str, chat_id: Optional[int] = None):
+        """Sends input to a specific tmux pane or window."""
+        target_chat = chat_id or self.last_chat_id
+        parts = args.strip().split(maxsplit=1)
+        if len(parts) < 2:
+            msg = "ℹ️ *Uso comando:* `/send <nome_finestra_o_target> <testo_da_inviare>`\nEsempio: `/send News 1` oppure `/send 0:3.1 /status`"
+            if target_chat and self.client:
+                await self.client.send_message(target_chat, msg, reply_markup=self.get_reply_keyboard(), parse_mode="Markdown")
+            return
+
+        dest, input_text = parts[0], parts[1]
+        sessions = await asyncio.to_thread(self.tmux.discover_agy_sessions)
+        target = dest
+        for s in sessions:
+            if s["window_name"].lower() == dest.lower() or s["target"] == dest:
+                target = s["target"]
+                break
+
+        success = await asyncio.to_thread(self.tmux.send_input, target, input_text)
+        if success:
+            res_msg = f"✅ Inviato input a tmux (`{target}`):\n`{input_text}`"
+        else:
+            res_msg = f"❌ Impossibile inviare input al target tmux `{target}`."
+
+        if target_chat and self.client:
+            await self.client.send_message(target_chat, res_msg, reply_markup=self.get_reply_keyboard(), parse_mode="Markdown")
+        else:
+            self.ui.log_info(res_msg.replace("`", ""))
 
     async def cmd_agy_options(self, chat_id: Optional[int] = None, message_id: Optional[int] = None):
         """Displays the full Agy terminal options and workflows panel."""
@@ -1150,6 +1228,28 @@ class BotApp:
             elif data == "news:refresh":
                 await self.cmd_news(chat_id, message_id=msg.get("message_id"))
                 return
+            elif data == "menu:tmux" or data == "tmux:refresh":
+                await self.cmd_tmux(chat_id, message_id=msg.get("message_id"))
+                return
+            elif data.startswith("tmux:screen:"):
+                t_target = data.split(":", 2)[2]
+                await self.cmd_tmux_screen(t_target, chat_id)
+                return
+            elif data.startswith("tmux:send:"):
+                parts = data.split(":", 3)
+                if len(parts) >= 4:
+                    t_target = parts[2]
+                    t_val = parts[3]
+                    success = await asyncio.to_thread(self.tmux.send_input, t_target, t_val)
+                    if msg.get("message_id"):
+                        await self.client.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=msg["message_id"],
+                            text=f"✅ Risposta `{t_val}` inviata a tmux (`{t_target}`)",
+                            reply_markup=None,
+                            parse_mode="Markdown"
+                        )
+                return
             elif data == "menu:main":
                 if msg.get("message_id"):
                     await self.client.edit_message_text(
@@ -1320,6 +1420,15 @@ class BotApp:
                 await self.cmd_news(chat_id)
                 return
 
+            if text_lower in ["🖥️ tmux agy", "tmux", "/tmux", "tmux agy", "/sessions"]:
+                await self.cmd_tmux(chat_id)
+                return
+
+            if text_lower.startswith("/send "):
+                arg_val = text[6:].strip()
+                await self.cmd_send(arg_val, chat_id)
+                return
+
             if text_lower.startswith(("/screen", "/schermo", "screen", "schermo", "🖥️ schermo", "🖥️ screen")) or text_lower in ["🖥️ schermo", "schermo", "screen"]:
                 parts = text.split(maxsplit=1)
                 arg_val = parts[1] if len(parts) > 1 and not parts[0].startswith("🖥️") else ""
@@ -1431,6 +1540,9 @@ class BotApp:
                     "• *🖥️ Schermo:* `/screen on` o `/screen off` per accendere o spegnere il display del PC\n"
                     "• *🎵 Media:* `/media` controlli multimediali (Play/Pausa, Skip, Volume PC, Muto)\n"
                     "• *📊 Hardware:* `/hardware` o `/top` per monitorare CPU, RAM, Disco, Temp e Batteria in tempo reale\n"
+                    "• *🖥️ Tmux Agy:* `/tmux` per vedere tutte le sessioni Agy attive in tmux, subagenti e live screen\n"
+                    "• *✍️ Invia Input:* `/send <finestra> <testo>` per rispondere direttamente a una sessione Agy in tmux\n"
+                    "• *📰 News:* `/news` per monitorare il progetto multi-agente in ~/Progetti/News\n"
                     "• *🔔 Notifiche:* `/notify` per gestire pop-up desktop Linux, avvisi sonori e push Telegram\n"
                     "• *🎛️ Opzioni Agy:* Menu interattivo con tutte le opzioni da terminale (Usage, Credits, MCP, Skills)\n"
                     "• *📊 /usage:* Mostra le quote residue settimanali e su 5 ore di tutti i modelli\n"
@@ -1470,13 +1582,17 @@ class BotApp:
             await self.handle_prompt(text, source="telegram", chat_id=chat_id)
 
     async def _teamwork_watch_loop(self):
-        """Background watcher that pushes notifications when ~/Progetti/News progresses."""
+        """Background watcher that pushes notifications when ~/Progetti/News or any tmux Agy session progresses."""
         while not self._shutdown_event.is_set():
             try:
-                await asyncio.sleep(15)
-                has_update, desc = await asyncio.to_thread(self.news_monitor.check_for_updates)
+                await asyncio.sleep(12)
                 target_chat = self.last_chat_id or (self.config.allowed_user_ids[0] if self.config.allowed_user_ids else None)
-                if has_update and target_chat and self.client:
+                if not target_chat or not self.client:
+                    continue
+
+                # 1. Check ~/Progetti/News filesystem updates
+                has_update, desc = await asyncio.to_thread(self.news_monitor.check_for_updates)
+                if has_update:
                     push_msg = (
                         f"📢 *Aggiornamento Teamwork in ~/Progetti/News*\n\n"
                         f"• {desc}\n\n"
@@ -1497,10 +1613,66 @@ class BotApp:
                         body=desc[:90],
                         is_question=False
                     )
+
+                # 2. Check general tmux agy sessions
+                events = await asyncio.to_thread(self.tmux.check_for_session_events)
+                for ev in events:
+                    w_name = ev["window_name"]
+                    t_target = ev["target"]
+                    sub_info = f" • 🤖 `{ev['subagents_count']} subagenti`" if ev.get("subagents_count") else ""
+
+                    if ev["event_type"] == "question":
+                        q_msg = (
+                            f"🔔 *Antigravity attende una risposta in tmux!*\n\n"
+                            f"• *Finestra:* `{w_name}` (`{t_target}`){sub_info}\n"
+                            f"• *Cartella:* `{ev['cwd']}`\n\n"
+                            f"```text\n{ev['snippet']}\n```"
+                        )
+                        # Build buttons for choices if available
+                        kb_rows = []
+                        if ev.get("choices"):
+                            for ch in ev["choices"][:4]:
+                                idx_str = ch.split(".", 1)[0].strip() if "." in ch else ch[:10]
+                                kb_rows.append([{"text": f"👉 {ch[:35]}", "callback_data": f"tmux:send:{t_target}:{idx_str}"}])
+                        kb_rows.append([
+                            {"text": f"👁️ Vedi Schermo {w_name}", "callback_data": f"tmux:screen:{t_target}"},
+                            {"text": "🖥️ Tutte le Sessioni", "callback_data": "menu:tmux"}
+                        ])
+                        reply_kb = self.client.build_inline_keyboard(kb_rows)
+                        await self.client.send_message(
+                            target_chat,
+                            q_msg,
+                            reply_markup=reply_kb,
+                            parse_mode="Markdown",
+                            disable_notification=False
+                        )
+                        self.notifier.trigger_local_alert(
+                            title=f"🔔 Domanda Antigravity ({w_name})",
+                            body=ev["snippet"][:90],
+                            is_question=True
+                        )
+                    else:
+                        u_msg = (
+                            f"⚙️ *Avanzamento Agy in tmux:* `{w_name}`{sub_info}\n\n"
+                            f"```text\n{ev['snippet']}\n```"
+                        )
+                        kb_rows = [
+                            [{"text": f"👁️ Schermo Live: {w_name}", "callback_data": f"tmux:screen:{t_target}"}],
+                            [{"text": "🖥️ Tutte le Sessioni", "callback_data": "menu:tmux"}]
+                        ]
+                        reply_kb = self.client.build_inline_keyboard(kb_rows)
+                        await self.client.send_message(
+                            target_chat,
+                            u_msg,
+                            reply_markup=reply_kb,
+                            parse_mode="Markdown",
+                            disable_notification=False
+                        )
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Error in teamwork watcher: {e}")
+                logger.error(f"Error in background monitor: {e}")
                 await asyncio.sleep(15)
 
     async def run(self):
