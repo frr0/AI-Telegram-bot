@@ -16,6 +16,7 @@ from power_monitor import get_power_report
 from screen_manager import set_screen_power, lock_screen, unlock_screen
 from media_manager import MediaManager
 from hardware_monitor import HardwareMonitor
+from teamwork_monitor import TeamworkMonitor
 from notification_manager import (
     NotificationManager,
     build_completion_header,
@@ -49,11 +50,13 @@ class BotApp:
         self.notifier = NotificationManager()
         self.media = MediaManager()
         self.hw = HardwareMonitor()
+        self.news_monitor = TeamworkMonitor()
 
         self.last_chat_id: Optional[int] = None
         self.pending_choices: Dict[int, str] = {} # choice_index -> choice_value
         self.is_processing = False
         self._shutdown_event = asyncio.Event()
+        self.teamwork_watcher_task: Optional[asyncio.Task] = None
 
     def get_reply_keyboard(self) -> Dict[str, Any]:
         """Persistent bottom keyboard for Telegram on mobile/desktop."""
@@ -89,7 +92,8 @@ class BotApp:
                 {"text": "💡 Accendi Schermo", "callback_data": "menu:screen_on"}
             ],
             [
-                {"text": "🔔 Impostazioni Notifiche", "callback_data": "menu:notifications"}
+                {"text": "🔔 Impostazioni Notifiche", "callback_data": "menu:notifications"},
+                {"text": "📰 Teamwork News", "callback_data": "menu:news"}
             ],
             [
                 {"text": "🎛️ Tutte le Opzioni da Terminale Agy", "callback_data": "agy:menu"}
@@ -226,6 +230,7 @@ class BotApp:
             {"command": "screen", "description": "🖥️ Accendi o spegni lo schermo del PC (on / off)"},
             {"command": "media", "description": "🎵 Controlli multimediali e volume PC"},
             {"command": "hardware", "description": "📊 Monitor risorse hardware in tempo reale (CPU, RAM, Disco, Temp)"},
+            {"command": "news", "description": "📰 Monitor del team di agenti in ~/Progetti/News"},
             {"command": "notify", "description": "🔔 Gestisci notifiche push e avvisi sonori/desktop"},
             {"command": "agy", "description": "🎛️ Opzioni e strumenti da terminale Agy (usage, mcp, teamwork, ecc)"},
             {"command": "usage", "description": "📊 Quote di utilizzo e limiti modelli Agy"},
@@ -494,6 +499,22 @@ class BotApp:
         target_chat = chat_id or self.last_chat_id
         report = await asyncio.to_thread(self.hw.get_hardware_report)
         kb = self.get_hardware_keyboard() if self.client else None
+        if target_chat and self.client:
+            if message_id:
+                await self.client.edit_message_text(chat_id=target_chat, message_id=message_id, text=report, reply_markup=kb, parse_mode="Markdown")
+            else:
+                await self.client.send_message(target_chat, text=report, reply_markup=kb, parse_mode="Markdown")
+        else:
+            self.ui.log_info(report.replace("*", "").replace("`", ""))
+
+    async def cmd_news(self, chat_id: Optional[int] = None, message_id: Optional[int] = None):
+        """Displays live status of the ~/Progetti/News teamwork multi-agent session."""
+        target_chat = chat_id or self.last_chat_id
+        report = await asyncio.to_thread(self.news_monitor.format_news_card)
+        kb = self.client.build_inline_keyboard([
+            [{"text": "🔄 Aggiorna Stato News", "callback_data": "news:refresh"}],
+            [{"text": "🔙 Torna al Menu", "callback_data": "menu:main"}]
+        ]) if self.client else None
         if target_chat and self.client:
             if message_id:
                 await self.client.edit_message_text(chat_id=target_chat, message_id=message_id, text=report, reply_markup=kb, parse_mode="Markdown")
@@ -1123,6 +1144,12 @@ class BotApp:
             elif data == "hw:refresh":
                 await self.cmd_hardware(chat_id, message_id=msg.get("message_id"))
                 return
+            elif data == "menu:news":
+                await self.cmd_news(chat_id, message_id=msg.get("message_id"))
+                return
+            elif data == "news:refresh":
+                await self.cmd_news(chat_id, message_id=msg.get("message_id"))
+                return
             elif data == "menu:main":
                 if msg.get("message_id"):
                     await self.client.edit_message_text(
@@ -1289,6 +1316,10 @@ class BotApp:
                 await self.cmd_hardware(chat_id)
                 return
 
+            if text_lower in ["📰 news", "news", "/news", "/progetti/news"]:
+                await self.cmd_news(chat_id)
+                return
+
             if text_lower.startswith(("/screen", "/schermo", "screen", "schermo", "🖥️ schermo", "🖥️ screen")) or text_lower in ["🖥️ schermo", "schermo", "screen"]:
                 parts = text.split(maxsplit=1)
                 arg_val = parts[1] if len(parts) > 1 and not parts[0].startswith("🖥️") else ""
@@ -1438,15 +1469,50 @@ class BotApp:
             # Regular prompt
             await self.handle_prompt(text, source="telegram", chat_id=chat_id)
 
+    async def _teamwork_watch_loop(self):
+        """Background watcher that pushes notifications when ~/Progetti/News progresses."""
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.sleep(15)
+                has_update, desc = await asyncio.to_thread(self.news_monitor.check_for_updates)
+                target_chat = self.last_chat_id or (self.config.allowed_user_ids[0] if self.config.allowed_user_ids else None)
+                if has_update and target_chat and self.client:
+                    push_msg = (
+                        f"📢 *Aggiornamento Teamwork in ~/Progetti/News*\n\n"
+                        f"• {desc}\n\n"
+                        f"_Digita /news o usa il pulsante sotto per visualizzare il report completo._"
+                    )
+                    kb = self.client.build_inline_keyboard([
+                        [{"text": "📰 Apri Report Completo News", "callback_data": "menu:news"}]
+                    ])
+                    await self.client.send_message(
+                        target_chat,
+                        push_msg,
+                        reply_markup=kb,
+                        parse_mode="Markdown",
+                        disable_notification=False
+                    )
+                    self.notifier.trigger_local_alert(
+                        title="📢 Teamwork News: Aggiornamento!",
+                        body=desc[:90],
+                        is_question=False
+                    )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in teamwork watcher: {e}")
+                await asyncio.sleep(15)
+
     async def run(self):
         if not await self.initialize():
             return
 
         self.ui.set_input_callback(self.handle_terminal_input)
 
-        # Start terminal listener and Telegram poller
+        # Start terminal listener, Telegram poller, and teamwork watcher
         terminal_task = asyncio.create_task(self.ui.start_input_listener())
         polling_task = asyncio.create_task(self.poll_telegram())
+        teamwork_task = asyncio.create_task(self._teamwork_watch_loop())
 
         # Wait until shutdown event is triggered
         try:
@@ -1455,6 +1521,7 @@ class BotApp:
             self.ui.log_info("Shutting down bot...")
             terminal_task.cancel()
             polling_task.cancel()
+            teamwork_task.cancel()
             if self.client:
                 await self.client.close()
             self.ui.stop()
