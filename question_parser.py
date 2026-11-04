@@ -144,8 +144,11 @@ class QuestionParser:
 
     @staticmethod
     def _parse_yes_no(text: str) -> Optional[Tuple[str, List[QuestionChoice]]]:
-        # Matches ending with (Yes/No), [y/n], etc.
-        m = re.search(r'([^\n\.\?]+(?:\?|\:)?)\s*[\(\[]\s*(?:y(?:es)?\s*\/\s*n(?:o)?)\s*[\)\]]', text, re.IGNORECASE)
+        # Strip code blocks and inline backticks to avoid false matches in explanations
+        cleaned = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
+        cleaned = re.sub(r'`.*?`', '', cleaned)
+        # Matches actual questions ending with (Yes/No), [y/n], etc.
+        m = re.search(r'([^\n\.]+\?)\s*[\(\[]\s*(?:y(?:es)?\s*\/\s*n(?:o)?)\s*[\)\]]', cleaned, re.IGNORECASE)
         if m:
             question = m.group(1).strip()
             choices = [
