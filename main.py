@@ -11,6 +11,7 @@ from agy_engine import AgyEngine, KNOWN_MODELS, normalize_model_name
 from terminal_ui import TerminalUI
 from question_parser import QuestionParser, QuestionChoice
 from history_manager import HistoryManager
+from power_monitor import get_power_report
 
 # Setup basic logging
 logging.basicConfig(
@@ -38,7 +39,8 @@ class BotApp:
         return self.client.build_reply_keyboard([
             ["🛑 Stop", "➕ Nuova Chat"],
             ["📜 Cronologia", "📊 Stato"],
-            ["🧠 Modello", "📋 Menu"]
+            ["⚡ Consumi", "🧠 Modello"],
+            ["📋 Menu"]
         ], resize_keyboard=True, is_persistent=True)
 
     def get_inline_menu(self) -> Dict[str, Any]:
@@ -53,6 +55,7 @@ class BotApp:
                 {"text": "📊 Stato", "callback_data": "menu:status"}
             ],
             [
+                {"text": "⚡ Consumi", "callback_data": "menu:power"},
                 {"text": "🧠 Seleziona Modello", "callback_data": "menu:models"}
             ]
         ])
@@ -105,6 +108,7 @@ class BotApp:
             {"command": "new", "description": "➕ Nuova chat / resetta sessione"},
             {"command": "history", "description": "📜 Mostra la cronologia della chat"},
             {"command": "status", "description": "📊 Visualizza lo stato del bot"},
+            {"command": "power", "description": "⚡ Visualizza i consumi energetici e costi (PC & RPi0W)"},
             {"command": "model", "description": "🧠 Visualizza o cambia il modello AI"}
         ]
         await self.client.set_my_commands(bot_commands)
@@ -216,6 +220,20 @@ class BotApp:
             )
         else:
             self.ui.log_info(msg.replace("*", "").replace("`", ""))
+
+    async def cmd_power(self, chat_id: Optional[int] = None):
+        """Displays power consumption statistics and estimated costs."""
+        target_chat = chat_id or self.last_chat_id
+        report = await asyncio.to_thread(get_power_report)
+        if target_chat and self.client:
+            await self.client.send_message(
+                target_chat,
+                report,
+                reply_markup=self.get_reply_keyboard(),
+                parse_mode="Markdown"
+            )
+        else:
+            self.ui.log_info(report.replace("*", "").replace("`", ""))
 
     async def cmd_models(self, chat_id: Optional[int] = None):
         """Displays model switcher."""
@@ -373,6 +391,9 @@ class BotApp:
             elif cmd in ["/status", "/stato"]:
                 await self.cmd_status()
                 return
+            elif cmd in ["/power", "/consumi"]:
+                await self.cmd_power()
+                return
             elif cmd in ["/model", "/modello"]:
                 if arg:
                     norm = normalize_model_name(arg)
@@ -386,6 +407,7 @@ class BotApp:
             elif cmd == "/help":
                 print("Available commands:")
                 print("  /status      - Mostra lo stato del bot")
+                print("  /power       - Mostra consumi energetici e costi stimati (PC & RPi0W)")
                 print("  /new         - Resetta e avvia una nuova sessione")
                 print("  /history     - Mostra la cronologia della sessione")
                 print("  /stop        - Ferma l'attività in corso")
@@ -498,6 +520,9 @@ class BotApp:
                 return
             elif data == "menu:status":
                 await self.cmd_status(chat_id)
+                return
+            elif data == "menu:power":
+                await self.cmd_power(chat_id)
                 return
             elif data == "menu:models":
                 await self.cmd_models(chat_id)
@@ -613,6 +638,10 @@ class BotApp:
                 await self.cmd_status(chat_id)
                 return
 
+            if text_lower in ["⚡ consumi", "consumi", "power", "/power", "/consumi"]:
+                await self.cmd_power(chat_id)
+                return
+
             if text_lower in ["🧠 modello", "modello", "model", "/model"]:
                 if text_lower.startswith("/model") and len(text.split(maxsplit=1)) > 1:
                     new_model = text.split(maxsplit=1)[1].strip()
@@ -642,6 +671,7 @@ class BotApp:
                     "• *➕ Nuova Chat:* Avvia una nuova sessione pulita\n"
                     "• *📜 Cronologia:* Mostra i messaggi e turni della sessione corrente\n"
                     "• *📊 Stato:* Informazioni sul modello attivo e cartella di lavoro\n"
+                    "• *⚡ Consumi:* Visualizza consumi in Watt/h, tempo di attività e costi stimati\n"
                     "• *🧠 Modello:* Menu interattivo per cambiare modello AI\n"
                     "• *📋 Menu:* Visualizza il pannello comandi inline"
                 )
