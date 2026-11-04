@@ -14,6 +14,8 @@ from question_parser import QuestionParser, QuestionChoice
 from history_manager import HistoryManager
 from power_monitor import get_power_report
 from screen_manager import set_screen_power, lock_screen, unlock_screen
+from media_manager import MediaManager
+from hardware_monitor import HardwareMonitor
 from notification_manager import (
     NotificationManager,
     build_completion_header,
@@ -45,6 +47,8 @@ class BotApp:
         self.engine: Optional[AgyEngine] = None
         self.history = HistoryManager()
         self.notifier = NotificationManager()
+        self.media = MediaManager()
+        self.hw = HardwareMonitor()
 
         self.last_chat_id: Optional[int] = None
         self.pending_choices: Dict[int, str] = {} # choice_index -> choice_value
@@ -55,9 +59,10 @@ class BotApp:
         """Persistent bottom keyboard for Telegram on mobile/desktop."""
         return self.client.build_reply_keyboard([
             ["🛑 Stop", "➕ Nuova Chat"],
-            ["📜 Cronologia", "📊 Stato"],
+            ["📜 Cronologia", "📊 Hardware"],
             ["⚡ Consumi", "🖥️ Schermo"],
-            ["🎛️ Opzioni Agy", "📋 Menu"]
+            ["🎵 Media", "🎛️ Opzioni Agy"],
+            ["📋 Menu", "📊 Stato"]
         ], resize_keyboard=True, is_persistent=True)
 
     def get_inline_menu(self) -> Dict[str, Any]:
@@ -70,6 +75,10 @@ class BotApp:
             [
                 {"text": "📜 Cronologia", "callback_data": "menu:history"},
                 {"text": "📊 Stato", "callback_data": "menu:status"}
+            ],
+            [
+                {"text": "🎵 Media & Volume", "callback_data": "menu:media"},
+                {"text": "📊 Monitor Hardware", "callback_data": "menu:hardware"}
             ],
             [
                 {"text": "⚡ Consumi", "callback_data": "menu:power"},
@@ -97,6 +106,34 @@ class BotApp:
                 {"text": sound_status, "callback_data": "notify:toggle_sound"}
             ],
             [
+                {"text": "🔙 Torna al Menu", "callback_data": "menu:main"}
+            ]
+        ])
+
+    def get_media_keyboard(self) -> Dict[str, Any]:
+        """Interactive inline keyboard for media player and volume controls."""
+        return self.client.build_inline_keyboard([
+            [
+                {"text": "⏮️ Prec", "callback_data": "media:prev"},
+                {"text": "⏯️ Play/Pausa", "callback_data": "media:playpause"},
+                {"text": "⏭️ Succ", "callback_data": "media:next"}
+            ],
+            [
+                {"text": "🔉 Vol -5%", "callback_data": "media:voldn"},
+                {"text": "🔇 Muto", "callback_data": "media:mute"},
+                {"text": "🔊 Vol +5%", "callback_data": "media:volup"}
+            ],
+            [
+                {"text": "🔄 Aggiorna", "callback_data": "media:refresh"},
+                {"text": "🔙 Torna al Menu", "callback_data": "menu:main"}
+            ]
+        ])
+
+    def get_hardware_keyboard(self) -> Dict[str, Any]:
+        """Interactive inline keyboard for hardware monitor."""
+        return self.client.build_inline_keyboard([
+            [
+                {"text": "🔄 Aggiorna Metriche", "callback_data": "hw:refresh"},
                 {"text": "🔙 Torna al Menu", "callback_data": "menu:main"}
             ]
         ])
@@ -187,6 +224,8 @@ class BotApp:
             {"command": "status", "description": "📊 Visualizza lo stato del bot"},
             {"command": "power", "description": "⚡ Visualizza i consumi energetici e costi (PC & RPi0W)"},
             {"command": "screen", "description": "🖥️ Accendi o spegni lo schermo del PC (on / off)"},
+            {"command": "media", "description": "🎵 Controlli multimediali e volume PC"},
+            {"command": "hardware", "description": "📊 Monitor risorse hardware in tempo reale (CPU, RAM, Disco, Temp)"},
             {"command": "notify", "description": "🔔 Gestisci notifiche push e avvisi sonori/desktop"},
             {"command": "agy", "description": "🎛️ Opzioni e strumenti da terminale Agy (usage, mcp, teamwork, ecc)"},
             {"command": "usage", "description": "📊 Quote di utilizzo e limiti modelli Agy"},
@@ -436,6 +475,32 @@ class BotApp:
                 await self.client.send_message(target_chat, text, reply_markup=kb, parse_mode="Markdown")
         else:
             self.ui.log_info(text.replace("*", ""))
+
+    async def cmd_media(self, chat_id: Optional[int] = None, message_id: Optional[int] = None):
+        """Displays media player & volume controller."""
+        target_chat = chat_id or self.last_chat_id
+        report = await asyncio.to_thread(self.media.get_media_report)
+        kb = self.get_media_keyboard() if self.client else None
+        if target_chat and self.client:
+            if message_id:
+                await self.client.edit_message_text(chat_id=target_chat, message_id=message_id, text=report, reply_markup=kb, parse_mode="Markdown")
+            else:
+                await self.client.send_message(target_chat, text=report, reply_markup=kb, parse_mode="Markdown")
+        else:
+            self.ui.log_info(report.replace("*", "").replace("`", ""))
+
+    async def cmd_hardware(self, chat_id: Optional[int] = None, message_id: Optional[int] = None):
+        """Displays real-time hardware status."""
+        target_chat = chat_id or self.last_chat_id
+        report = await asyncio.to_thread(self.hw.get_hardware_report)
+        kb = self.get_hardware_keyboard() if self.client else None
+        if target_chat and self.client:
+            if message_id:
+                await self.client.edit_message_text(chat_id=target_chat, message_id=message_id, text=report, reply_markup=kb, parse_mode="Markdown")
+            else:
+                await self.client.send_message(target_chat, text=report, reply_markup=kb, parse_mode="Markdown")
+        else:
+            self.ui.log_info(report.replace("*", "").replace("`", ""))
 
     async def cmd_agy_options(self, chat_id: Optional[int] = None, message_id: Optional[int] = None):
         """Displays the full Agy terminal options and workflows panel."""
@@ -1022,6 +1087,42 @@ class BotApp:
                 self.notifier.toggle_sound()
                 await self.cmd_notify(chat_id, message_id=msg.get("message_id"))
                 return
+            elif data == "menu:media":
+                await self.cmd_media(chat_id, message_id=msg.get("message_id"))
+                return
+            elif data == "menu:hardware":
+                await self.cmd_hardware(chat_id, message_id=msg.get("message_id"))
+                return
+            elif data == "media:playpause":
+                await asyncio.to_thread(self.media.play_pause)
+                await self.cmd_media(chat_id, message_id=msg.get("message_id"))
+                return
+            elif data == "media:next":
+                await asyncio.to_thread(self.media.next_track)
+                await self.cmd_media(chat_id, message_id=msg.get("message_id"))
+                return
+            elif data == "media:prev":
+                await asyncio.to_thread(self.media.prev_track)
+                await self.cmd_media(chat_id, message_id=msg.get("message_id"))
+                return
+            elif data == "media:volup":
+                await asyncio.to_thread(self.media.volume_up, 5)
+                await self.cmd_media(chat_id, message_id=msg.get("message_id"))
+                return
+            elif data == "media:voldn":
+                await asyncio.to_thread(self.media.volume_down, 5)
+                await self.cmd_media(chat_id, message_id=msg.get("message_id"))
+                return
+            elif data == "media:mute":
+                await asyncio.to_thread(self.media.toggle_mute)
+                await self.cmd_media(chat_id, message_id=msg.get("message_id"))
+                return
+            elif data == "media:refresh":
+                await self.cmd_media(chat_id, message_id=msg.get("message_id"))
+                return
+            elif data == "hw:refresh":
+                await self.cmd_hardware(chat_id, message_id=msg.get("message_id"))
+                return
             elif data == "menu:main":
                 if msg.get("message_id"):
                     await self.client.edit_message_text(
@@ -1180,6 +1281,14 @@ class BotApp:
                 await self.cmd_power(chat_id)
                 return
 
+            if text_lower in ["🎵 media", "media", "/media", "/music", "musica", "/player", "/volume", "/vol"]:
+                await self.cmd_media(chat_id)
+                return
+
+            if text_lower in ["📊 hardware", "hardware", "/hardware", "/hw", "/top"]:
+                await self.cmd_hardware(chat_id)
+                return
+
             if text_lower.startswith(("/screen", "/schermo", "screen", "schermo", "🖥️ schermo", "🖥️ screen")) or text_lower in ["🖥️ schermo", "schermo", "screen"]:
                 parts = text.split(maxsplit=1)
                 arg_val = parts[1] if len(parts) > 1 and not parts[0].startswith("🖥️") else ""
@@ -1289,6 +1398,8 @@ class BotApp:
                     "• *📊 Stato:* Informazioni sul modello attivo e cartella di lavoro\n"
                     "• *⚡ Consumi:* Visualizza consumi in Watt/h, tempo di attività e costi stimati\n"
                     "• *🖥️ Schermo:* `/screen on` o `/screen off` per accendere o spegnere il display del PC\n"
+                    "• *🎵 Media:* `/media` controlli multimediali (Play/Pausa, Skip, Volume PC, Muto)\n"
+                    "• *📊 Hardware:* `/hardware` o `/top` per monitorare CPU, RAM, Disco, Temp e Batteria in tempo reale\n"
                     "• *🔔 Notifiche:* `/notify` per gestire pop-up desktop Linux, avvisi sonori e push Telegram\n"
                     "• *🎛️ Opzioni Agy:* Menu interattivo con tutte le opzioni da terminale (Usage, Credits, MCP, Skills)\n"
                     "• *📊 /usage:* Mostra le quote residue settimanali e su 5 ore di tutti i modelli\n"
