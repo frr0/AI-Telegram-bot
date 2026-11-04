@@ -29,86 +29,86 @@ class TestTmuxBridge(unittest.TestCase):
         card = self.bridge.format_sessions_card()
         self.assertIn("Sessioni Antigravity su tmux", card)
 
-    def test_parse_pane_output(self):
+    def test_running_subagents_do_not_require_intervention(self):
         sample = """
-  ### Aggiornamento di Avanzamento (Teamwork)
-  • Milestone 1 in corso
-──────────────────────────────
+  • Milestone 1 completata
+  • Squadra di verifica attiva (Gate Check)
+──────────────────────────────────────────────────
 >
-  ● Agent(test: Test Subagent) Running · 1m
-──────────────────────────────
+──────────────────────────────────────────────────
+  ● Agent(auditor: Milestone 1 Auditor) Running · 3m
+  ● Agent(orchestrator: Project Orchestrator) Working · 34m
+──────────────────────────────────────────────────
 ? for shortcuts | Gemini 3.8 Flash | 3 subagent(s)
 """
         parsed = self.bridge.parse_pane_content(sample)
         self.assertEqual(parsed["subagents_count"], 3)
-        self.assertTrue(parsed["is_waiting_input"])
-        self.assertIn("Milestone 1 in corso", parsed["main_text"])
+        self.assertFalse(parsed["requires_intervention"], "Running subagents without choices must NOT require intervention!")
+        self.assertEqual(len(parsed["choices"]), 0)
 
-    def test_filter_intermediate_updates_no_event(self):
+    def test_question_with_choices_requires_intervention(self):
         sample = """
+Come desideri procedere per i test?
+1. Esegui test unitari
+2. Salta e procedi
+──────────────────────────────────────────────────
+>
+──────────────────────────────────────────────────
+? for shortcuts | Gemini 3.8 Flash | 0 subagent(s)
+"""
+        parsed = self.bridge.parse_pane_content(sample)
+        self.assertTrue(parsed["requires_intervention"])
+        self.assertEqual(len(parsed["choices"]), 2)
+        self.assertEqual(parsed["choices"][0], "1. Esegui test unitari")
+
+    def test_check_events_only_notifies_on_choice_or_completion(self):
+        running_sample = """
   Milestone 1 in corso
   Running command npm install
-"""
-        with patch.object(self.bridge, "discover_agy_sessions", return_value=[{"target": "0:9.1", "window_name": "Test", "cwd": "/tmp"}]), \
-             patch.object(self.bridge, "inspect_pane", return_value={
-                 "main_text": sample,
-                 "is_waiting_input": False,
-                 "choices": [],
-                 "subagents_count": 2,
-                 "snippet": "Milestone 1 in corso"
-             }):
-            # First call establishes baseline
-            self.bridge.check_for_session_events()
-            # Second call with slightly different intermediate text
-            with patch.object(self.bridge, "inspect_pane", return_value={
-                "main_text": sample + "\nNext command",
-                "is_waiting_input": False,
-                "choices": [],
-                "subagents_count": 2,
-                "snippet": "Next command"
-            }):
-                events = self.bridge.check_for_session_events()
-                self.assertEqual(len(events), 0, "Intermediate progress must NOT generate notifications!")
-
-    def test_detect_choice_question(self):
-        sample = """
-Quale opzione preferisci?
-1. Opzione A
-2. Opzione B
+──────────────────────
 >
+──────────────────────
+? for shortcuts | 3 subagent(s)
 """
         with patch.object(self.bridge, "discover_agy_sessions", return_value=[{"target": "0:9.1", "window_name": "Test", "cwd": "/tmp"}]):
-            self.bridge._last_content_hashes["0:9.1"] = "old_hash"
-            self.bridge._last_waiting_state["0:9.1"] = False
-            with patch.object(self.bridge, "inspect_pane", return_value={
-                "main_text": sample,
-                "is_waiting_input": True,
-                "choices": ["1. Opzione A", "2. Opzione B"],
-                "subagents_count": 1,
-                "snippet": "Quale opzione preferisci?"
-            }):
+            # 1. Running state: must NOT notify
+            with patch.object(self.bridge, "inspect_pane", return_value=self.bridge.parse_pane_content(running_sample)):
+                events = self.bridge.check_for_session_events()
+                self.assertEqual(len(events), 0, "No notifications during running execution!")
+
+            # 2. When asking a question: MUST notify
+            question_sample = """
+Quale configurazione usare?
+1. Config A
+2. Config B
+──────────────────────
+>
+──────────────────────
+? for shortcuts | 0 subagent(s)
+"""
+            with patch.object(self.bridge, "inspect_pane", return_value=self.bridge.parse_pane_content(question_sample)):
                 events = self.bridge.check_for_session_events()
                 self.assertEqual(len(events), 1)
                 self.assertEqual(events[0]["event_type"], "question")
-                self.assertEqual(len(events[0]["choices"]), 2)
 
-    def test_detect_task_completion(self):
-        sample = """
-Your Teamwork run has finished. All milestones verified and deliverables ready!
+            # 3. Deduplication: same question must NOT notify again
+            with patch.object(self.bridge, "inspect_pane", return_value=self.bridge.parse_pane_content(question_sample)):
+                events_dupe = self.bridge.check_for_session_events()
+                self.assertEqual(len(events_dupe), 0, "Deduplication must prevent repeating the same question alert!")
+
+            # 4. When all agents finished: MUST notify
+            completion_sample = """
+Your Teamwork run has finished. All deliverables are complete!
+──────────────────────
+>
+──────────────────────
+? for shortcuts | 0 subagent(s)
 """
-        with patch.object(self.bridge, "discover_agy_sessions", return_value=[{"target": "0:9.1", "window_name": "Test", "cwd": "/tmp"}]):
-            self.bridge._last_content_hashes["0:9.1"] = "old_hash"
-            self.bridge._last_waiting_state["0:9.1"] = False
-            with patch.object(self.bridge, "inspect_pane", return_value={
-                "main_text": sample,
-                "is_waiting_input": True,
-                "choices": [],
-                "subagents_count": 0,
-                "snippet": "Your Teamwork run has finished."
-            }):
-                events = self.bridge.check_for_session_events()
-                self.assertEqual(len(events), 1)
-                self.assertEqual(events[0]["event_type"], "completed")
+            self.bridge._was_busy["0:9.1"] = True
+            with patch.object(self.bridge, "inspect_pane", return_value=self.bridge.parse_pane_content(completion_sample)):
+                events_comp = self.bridge.check_for_session_events()
+                self.assertEqual(len(events_comp), 1)
+                self.assertEqual(events_comp[0]["event_type"], "completed")
 
 
 if __name__ == "__main__":

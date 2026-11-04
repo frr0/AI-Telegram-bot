@@ -1582,39 +1582,15 @@ class BotApp:
             await self.handle_prompt(text, source="telegram", chat_id=chat_id)
 
     async def _teamwork_watch_loop(self):
-        """Background watcher that pushes notifications when ~/Progetti/News or any tmux Agy session progresses."""
+        """Background watcher that pushes notifications ONLY when user intervention is needed or all agents finish."""
         while not self._shutdown_event.is_set():
             try:
-                await asyncio.sleep(12)
+                await asyncio.sleep(10)
                 target_chat = self.last_chat_id or (self.config.allowed_user_ids[0] if self.config.allowed_user_ids else None)
                 if not target_chat or not self.client:
                     continue
 
-                # 1. Check ~/Progetti/News filesystem updates
-                has_update, desc = await asyncio.to_thread(self.news_monitor.check_for_updates)
-                if has_update:
-                    push_msg = (
-                        f"📢 *Aggiornamento Teamwork in ~/Progetti/News*\n\n"
-                        f"• {desc}\n\n"
-                        f"_Digita /news o usa il pulsante sotto per visualizzare il report completo._"
-                    )
-                    kb = self.client.build_inline_keyboard([
-                        [{"text": "📰 Apri Report Completo News", "callback_data": "menu:news"}]
-                    ])
-                    await self.client.send_message(
-                        target_chat,
-                        push_msg,
-                        reply_markup=kb,
-                        parse_mode="Markdown",
-                        disable_notification=False
-                    )
-                    self.notifier.trigger_local_alert(
-                        title="📢 Teamwork News: Aggiornamento!",
-                        body=desc[:90],
-                        is_question=False
-                    )
-
-                # 2. Check general tmux agy sessions
+                # Poll tmux agy sessions (strictly filtered: only question choices or full completion)
                 events = await asyncio.to_thread(self.tmux.check_for_session_events)
                 for ev in events:
                     w_name = ev["window_name"]
