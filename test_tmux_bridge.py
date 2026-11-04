@@ -110,6 +110,21 @@ Your Teamwork run has finished. All deliverables are complete!
                 self.assertEqual(len(events_comp), 1)
                 self.assertEqual(events_comp[0]["event_type"], "completed")
 
+            # 5. When subagents drop to 0 without regex: MUST notify
+            plain_finish_sample = """
+Build succeeded.
+──────────────────────
+>
+──────────────────────
+? for shortcuts | 0 subagent(s)
+"""
+            self.bridge._was_busy["0:9.1"] = True
+            self.bridge._notified_completions.clear()
+            with patch.object(self.bridge, "inspect_pane", return_value=self.bridge.parse_pane_content(plain_finish_sample)):
+                events_agents_done = self.bridge.check_for_session_events()
+                self.assertEqual(len(events_agents_done), 1)
+                self.assertEqual(events_agents_done[0]["event_type"], "completed")
+
 
 if __name__ == "__main__":
     unittest.main()

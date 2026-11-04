@@ -805,18 +805,17 @@ class BotApp:
                 model=self.engine.model
             )
 
-            # Trigger local desktop notification and chime
-            title = "🔔 Antigravity: Domanda in attesa!" if is_question else (
-                "✅ Antigravity: Task Completato" if success else "❌ Antigravity: Task Fallito"
-            )
-            first_line = output.split("\n", 1)[0]
-            summary_preview = (first_line[:90] + "...") if len(first_line) > 90 else first_line
-            self.notifier.trigger_local_alert(
-                title=title,
-                body=f"⏱️ {format_duration(elapsed)} • {summary_preview}",
-                is_question=is_question,
-                urgency="critical" if is_question else "normal"
-            )
+            # Only trigger loud alerts if user intervention is required
+            if is_question:
+                title = "🔔 Antigravity: Domanda in attesa!"
+                first_line = output.split("\n", 1)[0]
+                summary_preview = (first_line[:90] + "...") if len(first_line) > 90 else first_line
+                self.notifier.trigger_local_alert(
+                    title=title,
+                    body=f"⏱️ {format_duration(elapsed)} • {summary_preview}",
+                    is_question=True,
+                    urgency="critical"
+                )
 
             if question_data:
                 question_text, choices = question_data
@@ -836,7 +835,7 @@ class BotApp:
                         }])
                     reply_markup = self.client.build_inline_keyboard(keyboard_rows)
 
-                    # Send push notification header + question with buttons
+                    # Send push notification header + question with buttons (audible alert)
                     await self.client.send_message(
                         target_chat,
                         f"{push_header}\n\n{output}\n\n❓ *Question:* {question_text}",
@@ -846,12 +845,13 @@ class BotApp:
                     )
             else:
                 if target_chat and self.client:
+                    # Regular response without user intervention: silent delivery, no notification spam
                     await self.client.send_message(
                         target_chat,
-                        f"{push_header}\n\n{output}",
+                        output,
                         reply_markup=self.get_reply_keyboard(),
                         parse_mode="Markdown",
-                        disable_notification=False
+                        disable_notification=True
                     )
 
         except asyncio.CancelledError:

@@ -169,11 +169,16 @@ class TmuxBridge:
         choices = []
         has_question_tag = False
         for l in above_prompt:
-            m_ch = re.match(r'^[1-9]\.\s+(.*)', l)
+            m_ch = re.match(r'^(?:[1-9]\.|\([a-z]\))\s+(.*)', l)
             if m_ch:
                 choices.append(l)
-            if "[QUESTION:" in l or "come desideri procedere" in l.lower() or "quale opzione" in l.lower():
+            lower_line = l.lower()
+            if any(k in lower_line for k in ["[question:", "come desideri", "quale opzione", "[y/n]", "(y/n)", "(yes/no)"]) or l.startswith("? "):
                 has_question_tag = True
+
+        # Provide yes/no choices if confirmation prompt detected
+        if not choices and any(yn in " ".join(above_prompt).lower() for yn in ["[y/n]", "(y/n)", "(yes/no)"]):
+            choices = ["1. Yes (y)", "2. No (n)"]
 
         # Requires intervention ONLY if explicit choices or question is waiting above prompt
         requires_intervention = bool(choices) or (has_question_tag and idx_prompt != -1)
@@ -261,8 +266,8 @@ class TmuxBridge:
                 self._notified_completions.discard(target)
 
             # Case 1: Requires user intervention
-            if requires_intervention and choices:
-                q_hash = hashlib.md5("".join(choices).encode("utf-8")).hexdigest()
+            if requires_intervention:
+                q_hash = hashlib.md5((snippet + "".join(choices)).encode("utf-8")).hexdigest()
                 if self._notified_questions.get(target) != q_hash:
                     self._notified_questions[target] = q_hash
                     events.append({
@@ -278,7 +283,8 @@ class TmuxBridge:
                 continue
 
             # Case 2: All agents have finished the entire work
-            if is_completed:
+            agents_finished = bool(self._was_busy.get(target, False) and subagents_count == 0)
+            if is_completed or agents_finished:
                 if target not in self._notified_completions:
                     self._notified_completions.add(target)
                     self._was_busy[target] = False
