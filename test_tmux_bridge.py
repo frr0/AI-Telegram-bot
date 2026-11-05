@@ -46,6 +46,20 @@ class TestTmuxBridge(unittest.TestCase):
         self.assertFalse(parsed["requires_intervention"], "Running subagents without choices must NOT require intervention!")
         self.assertEqual(len(parsed["choices"]), 0)
 
+    def test_informational_steps_in_pane_not_requiring_intervention(self):
+        sample_steps = """
+Prossimi passi che il team eseguirà:
+1. Setup configurazione package.json
+2. Creazione script di build
+──────────────────────────────────────────────────
+>
+──────────────────────────────────────────────────
+? for shortcuts | Gemini 3.8 Flash | 0 subagent(s)
+"""
+        parsed = self.bridge.parse_pane_content(sample_steps)
+        self.assertFalse(parsed["requires_intervention"], "Informational future steps must not require user intervention!")
+        self.assertEqual(len(parsed["choices"]), 0)
+
     def test_question_with_choices_requires_intervention(self):
         sample = """
 Come desideri procedere per i test?

@@ -62,6 +62,36 @@ class QuestionParser:
             return question, choices
         return None
 
+    INFORMATIONAL_INDICATORS = [
+        "ecco", "dettagli", "modifiche", "novità", "passi", "step", "fasi",
+        "task", "elenco", "changelog", "riepilogo", "azioni", "piano",
+        "specificate", "note", "operazioni", "esempi", "caratteristiche",
+        "cosa farò", "cosa faremo", "cose da fare", "passi da seguire",
+        "attività svolte", "attività previste"
+    ]
+
+    QUESTION_INDICATORS = [
+        "quale", "quali", "come desideri", "come procedere", "come vuoi",
+        "cosa preferisci", "scegli", "seleziona", "confermi", "vuoi procedere",
+        "which", "how should", "what would", "choose", "select", "do you prefer"
+    ]
+
+    @staticmethod
+    def _is_actual_question_prompt(prompt: str) -> bool:
+        """Determines if the text preceding a list is a genuine question requiring user decision."""
+        if not prompt:
+            return False
+        clean = prompt.lower().strip()
+        # If it explicitly introduces informational details or future steps, it is NOT a question
+        if any(clean.startswith(inf) for inf in QuestionParser.INFORMATIONAL_INDICATORS):
+            return False
+        if any(inf in clean for inf in ["cosa farò", "cosa faremo", "cose fatte", "passi del team", "modifiche applicate"]):
+            return False
+
+        has_qmark = "?" in prompt
+        has_qwords = any(qw in clean for qw in QuestionParser.QUESTION_INDICATORS)
+        return has_qmark or has_qwords
+
     @staticmethod
     def _parse_numbered_choices(text: str) -> Optional[Tuple[str, List[QuestionChoice]]]:
         # Looks for patterns like:
@@ -95,15 +125,18 @@ class QuestionParser:
                     first_choice_str = f"1) {choice_lines[0][1]}"
                     pos = text.find(first_choice_str)
 
-                prompt = text[:pos].strip() if pos != -1 else "Please select an option:"
+                prompt = text[:pos].strip() if pos != -1 else ""
                 # Take the last sentence or paragraph as the direct question
                 if "\n" in prompt:
                     prompt_parts = [p.strip() for p in prompt.split("\n") if p.strip()]
                     if prompt_parts:
                         prompt = prompt_parts[-1]
 
+                if not QuestionParser._is_actual_question_prompt(prompt):
+                    return None
+
                 choices = [
-                    QuestionChoice(idx, label, f"{idx}. {label}")
+                    QuestionChoice(idx, f"{idx}. {label}", f"{idx}. {label}")
                     for idx, label in choice_lines
                 ]
                 return prompt or "Select an option:", choices
@@ -128,11 +161,14 @@ class QuestionParser:
         if len(choice_lines) >= 2 and choice_lines[0][0] == 'A' and choice_lines[1][0] == 'B':
             first_label = choice_lines[0][1]
             pos = text.find(first_label)
-            prompt = text[:pos].strip() if pos != -1 else "Please select an option:"
+            prompt = text[:pos].strip() if pos != -1 else ""
             if "\n" in prompt:
                 prompt_parts = [p.strip() for p in prompt.split("\n") if p.strip()]
                 if prompt_parts:
                     prompt = prompt_parts[-1]
+
+            if not QuestionParser._is_actual_question_prompt(prompt):
+                return None
 
             choices = [
                 QuestionChoice(i + 1, f"{letter}) {label}", f"{letter}) {label}")

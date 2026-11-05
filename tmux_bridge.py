@@ -180,8 +180,20 @@ class TmuxBridge:
         if not choices and any(yn in " ".join(above_prompt).lower() for yn in ["[y/n]", "(y/n)", "(yes/no)"]):
             choices = ["1. Yes (y)", "2. No (n)"]
 
-        # Requires intervention ONLY if explicit choices or question is waiting above prompt
-        requires_intervention = bool(choices) or (has_question_tag and idx_prompt != -1)
+        # If choices are present, verify that they are preceded by a genuine question and not an informational list of future steps
+        preceding_text = " ".join(above_prompt).lower()
+        is_informational_list = any(inf in preceding_text for inf in [
+            "ecco", "dettagli", "modifiche", "novità", "passi", "step", "fasi",
+            "task", "elenco", "changelog", "riepilogo", "prossimi", "azioni da",
+            "cose da fare", "attività previste"
+        ])
+
+        has_actual_question = has_question_tag or ("?" in " ".join(above_prompt))
+        if is_informational_list and not has_question_tag and not ("?" in preceding_text):
+            choices = []
+            requires_intervention = False
+        else:
+            requires_intervention = (bool(choices) and has_actual_question) or (has_question_tag and idx_prompt != -1)
 
         # 5. Check if complete
         is_completed = False
