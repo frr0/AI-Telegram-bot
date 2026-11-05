@@ -18,8 +18,13 @@ ENV/
 config.json
 local_config.json
 .chat_history.json
+.telegram_offset
+.commands_hash
 
 # IDE / Editor configs
 .vscode/
 .idea/
+
+# Multi-agent artifacts
+.agents/
 

@@ -38,10 +38,11 @@ class TmuxBridge:
     def is_tmux_available(self) -> bool:
         return shutil.which("tmux") is not None
 
-    def discover_agy_sessions(self) -> List[Dict[str, Any]]:
+    def discover_sessions(self, only_agy: bool = False, include_aibot: bool = False) -> List[Dict[str, Any]]:
         """
-        Scans all tmux panes across all sessions and returns those running an agy instance
-        (excluding AIbot itself).
+        Scans all tmux panes across all sessions.
+        If only_agy is True, only returns panes running agy.
+        If include_aibot is False, excludes AIbot pane.
         """
         if not self.is_tmux_available():
             return []
@@ -66,9 +67,13 @@ class TmuxBridge:
             if len(parts) < 4:
                 continue
             target, pid_str, win_name, cmd = parts[0], parts[1], parts[2], parts[3]
+            session_name = target.split(":")[0] if ":" in target else target
             try:
                 pane_pid = int(pid_str)
             except ValueError:
+                continue
+
+            if not include_aibot and win_name == "AIbot":
                 continue
 
             # Gather child PIDs
@@ -102,22 +107,41 @@ class TmuxBridge:
                 except Exception:
                     pass
 
-            # Exclude AIbot pane to prevent self-referencing loops
-            if is_agy and win_name != "AIbot":
-                parsed = self.inspect_pane(target)
-                sessions.append({
-                    "target": target,
-                    "window_name": win_name,
-                    "cwd": cwd,
-                    "pid": found_pid,
-                    "subagents_count": parsed.get("subagents_count", 0),
-                    "model": parsed.get("model", ""),
-                    "requires_intervention": parsed.get("requires_intervention", False),
-                    "is_completed": parsed.get("is_completed", False),
-                    "snippet": parsed.get("snippet", "")
-                })
+            if cwd == "unknown":
+                try:
+                    cwd = os.readlink(f"/proc/{pane_pid}/cwd")
+                except Exception:
+                    pass
+
+            if only_agy and not is_agy:
+                continue
+
+            parsed = self.inspect_pane(target) if is_agy else {}
+            sessions.append({
+                "target": target,
+                "session_name": session_name,
+                "name": session_name,
+                "window_name": win_name,
+                "command": cmd,
+                "cwd": cwd,
+                "pid": found_pid,
+                "is_agy": is_agy,
+                "subagents_count": parsed.get("subagents_count", 0),
+                "model": parsed.get("model", ""),
+                "requires_intervention": parsed.get("requires_intervention", False),
+                "is_completed": parsed.get("is_completed", False),
+                "snippet": parsed.get("snippet", "")
+            })
 
         return sessions
+
+    def discover_agy_sessions(self) -> List[Dict[str, Any]]:
+        """Scans all tmux panes and returns only those running agy."""
+        return self.discover_sessions(only_agy=True, include_aibot=False)
+
+    def discover_all_sessions(self, include_aibot: bool = True) -> List[Dict[str, Any]]:
+        """Scans all tmux panes across all sessions (both agy and generic)."""
+        return self.discover_sessions(only_agy=False, include_aibot=include_aibot)
 
     def inspect_pane(self, target: str) -> Dict[str, Any]:
         """Captures recent lines of a tmux pane and extracts agent activity & status."""
@@ -253,6 +277,40 @@ class TmuxBridge:
         except Exception:
             return False
 
+    def send_key(self, target: str, key: str) -> bool:
+        """Sends a single key or shortcut (e.g. 'C-c', 'Enter', 'Escape') to the specified tmux pane."""
+        if not self.is_tmux_available():
+            return False
+        try:
+            res = subprocess.run(
+                ["tmux", "send-keys", "-t", target, key],
+                capture_output=True,
+                text=True,
+                timeout=3
+            )
+            return res.returncode == 0
+        except Exception:
+            return False
+
+    def kill_session(self, target: str) -> bool:
+        """Terminates a tmux session."""
+        if not self.is_tmux_available():
+            return False
+        if not target:
+            return False
+        target_str = str(target)
+        session_name = target_str.split(":")[0] if ":" in target_str else target_str
+        try:
+            res = subprocess.run(
+                ["tmux", "kill-session", "-t", session_name],
+                capture_output=True,
+                text=True,
+                timeout=3
+            )
+            return res.returncode == 0
+        except Exception:
+            return False
+
     def create_session(
         self,
         session_name: Optional[str] = None,
@@ -312,30 +370,38 @@ class TmuxBridge:
         sessions = self.discover_agy_sessions()
 
         for s in sessions:
-            target = s["target"]
-            win_name = s["window_name"]
-            parsed = self.inspect_pane(target)
+            target = s.get("target")
+            if not target:
+                continue
+            target_str = str(target)
+            win_name = str(s.get("window_name") or s.get("name") or target_str)
+            cwd = str(s.get("cwd") or "unknown")
+            parsed = self.inspect_pane(target_str)
 
-            subagents_count = parsed.get("subagents_count", 0)
-            requires_intervention = parsed.get("requires_intervention", False)
-            is_completed = parsed.get("is_completed", False)
-            choices = parsed.get("choices", [])
-            snippet = parsed.get("snippet", "")
+            raw_sub = parsed.get("subagents_count")
+            try:
+                subagents_count = int(raw_sub) if raw_sub is not None else 0
+            except (ValueError, TypeError):
+                subagents_count = 0
+            requires_intervention = bool(parsed.get("requires_intervention", False))
+            is_completed = bool(parsed.get("is_completed", False))
+            choices = parsed.get("choices") or []
+            snippet = str(parsed.get("snippet") or "")
 
             # Track busy state
             if subagents_count > 0:
-                self._was_busy[target] = True
-                self._notified_completions.discard(target)
+                self._was_busy[target_str] = True
+                self._notified_completions.discard(target_str)
 
             # Case 1: Requires user intervention
             if requires_intervention:
-                q_hash = hashlib.md5((snippet + "".join(choices)).encode("utf-8")).hexdigest()
-                if self._notified_questions.get(target) != q_hash:
-                    self._notified_questions[target] = q_hash
+                q_hash = hashlib.md5((snippet + "".join(str(c) for c in choices)).encode("utf-8")).hexdigest()
+                if self._notified_questions.get(target_str) != q_hash:
+                    self._notified_questions[target_str] = q_hash
                     events.append({
-                        "target": target,
+                        "target": target_str,
                         "window_name": win_name,
-                        "cwd": s["cwd"],
+                        "cwd": cwd,
                         "event_type": "question",
                         "requires_intervention": True,
                         "subagents_count": subagents_count,
@@ -345,15 +411,15 @@ class TmuxBridge:
                 continue
 
             # Case 2: All agents have finished the entire work
-            agents_finished = bool(self._was_busy.get(target, False) and subagents_count == 0)
+            agents_finished = bool(self._was_busy.get(target_str, False) and subagents_count == 0)
             if is_completed or agents_finished:
-                if target not in self._notified_completions:
-                    self._notified_completions.add(target)
-                    self._was_busy[target] = False
+                if target_str not in self._notified_completions:
+                    self._notified_completions.add(target_str)
+                    self._was_busy[target_str] = False
                     events.append({
-                        "target": target,
+                        "target": target_str,
                         "window_name": win_name,
-                        "cwd": s["cwd"],
+                        "cwd": cwd,
                         "event_type": "completed",
                         "requires_intervention": False,
                         "subagents_count": 0,
@@ -367,31 +433,64 @@ class TmuxBridge:
 
         return events
 
-    def format_sessions_card(self) -> str:
-        """Builds an interactive Telegram Markdown card of all active agy sessions."""
-        sessions = self.discover_agy_sessions()
+    def format_sessions_card(self, only_agy: bool = True) -> str:
+        """Builds an interactive Telegram Markdown card of tmux sessions."""
+        sessions = self.discover_sessions(only_agy=only_agy, include_aibot=not only_agy)
         if not sessions:
-            return (
-                "🖥️ *Sessioni Antigravity su tmux*\n\n"
-                "⚪ _Nessuna sessione `agy` attiva rilevata in tmux al momento._\n"
-                "_(Puoi avviare Agy in qualsiasi finestra tmux sul PC e verrà rilevata automaticamente!)_"
-            )
+            if only_agy:
+                return (
+                    "🖥️ *Sessioni Antigravity su tmux*\n\n"
+                    "⚪ _Nessuna sessione `agy` attiva rilevata in tmux al momento._\n"
+                    "_(Puoi avviare Agy in qualsiasi finestra tmux sul PC e verrà rilevata automaticamente!)_"
+                )
+            else:
+                return (
+                    "🖥️ *Sessioni Tmux*\n\n"
+                    "⚪ _Nessuna sessione tmux attiva rilevata al momento._"
+                )
 
+        header_title = "Sessioni Antigravity su tmux" if only_agy else "Tutte le Sessioni Tmux"
         lines = [
-            f"🖥️ *Sessioni Antigravity su tmux ({len(sessions)} attive)*\n"
+            f"🖥️ *{header_title} ({len(sessions)} attive)*\n"
         ]
 
         for idx, s in enumerate(sessions, 1):
-            sub_tag = f" • 🤖 `{s['subagents_count']} subagenti`" if s['subagents_count'] > 0 else ""
-            status_tag = "⏳ Richiede tuo intervento" if s["requires_intervention"] else "⚙️ Al lavoro in background"
-            lines.append(
-                f"*{idx}. Finestra `{s['window_name']}`* (`{s['target']}`)\n"
-                f"   • *Cartella:* `{s['cwd']}`\n"
-                f"   • *Stato:* {status_tag}{sub_tag}\n"
-            )
-            if s["snippet"]:
-                lines.append(f"   • _Output recente:_ {s['snippet']}\n")
+            if s.get("is_agy"):
+                raw_sub = s.get("subagents_count")
+                try:
+                    subagents_count = int(raw_sub) if raw_sub is not None else 0
+                except (ValueError, TypeError):
+                    subagents_count = 0
+                requires_intervention = bool(s.get("requires_intervention", False))
+                window_name = str(s.get("window_name") or s.get("name") or "session")
+                target = str(s.get("target") or "")
+                cwd = str(s.get("cwd") or "unknown")
+                snippet = str(s.get("snippet") or "")
 
-        lines.append("💡 *Notifiche:* Riceverai messaggi solo quando ti viene chiesta una scelta o tutti gli agenti hanno terminato.")
+                sub_tag = f" • 🤖 `{subagents_count} subagenti`" if subagents_count > 0 else ""
+                status_tag = "⏳ Richiede tuo intervento" if requires_intervention else "⚙️ Al lavoro in background"
+                lines.append(
+                    f"*{idx}. 🪐 Finestra `{window_name}`* (`{target}`)\n"
+                    f"   • *Cartella:* `{cwd}`\n"
+                    f"   • *Stato:* {status_tag}{sub_tag}\n"
+                )
+                if snippet:
+                    lines.append(f"   • _Output recente:_ {snippet}\n")
+            else:
+                window_name = str(s.get("window_name") or s.get("name") or "session")
+                target = str(s.get("target") or "")
+                cwd = str(s.get("cwd") or "unknown")
+                cmd_name = str(s.get("command") or "bash")
+                pid = str(s.get("pid") if s.get("pid") is not None else "N/A")
+                lines.append(
+                    f"*{idx}. 💻 Finestra `{window_name}`* (`{target}`)\n"
+                    f"   • *Cartella:* `{cwd}`\n"
+                    f"   • *Comando:* `{cmd_name}` (PID: `{pid}`)\n"
+                )
+
+        if only_agy:
+            lines.append("💡 *Notifiche:* Riceverai messaggi solo quando ti viene chiesta una scelta o tutti gli agenti hanno terminato.")
+        else:
+            lines.append("💡 *Usa i pulsanti o `/send <finestra> <testo>` per interagire con qualunque sessione.*")
 
         return "\n".join(lines)

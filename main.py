@@ -1,6 +1,9 @@
 import asyncio
 import fcntl
+import hashlib
+import json
 import logging
+import os
 import signal
 import sys
 import time
@@ -35,10 +38,16 @@ from agy_manager import (
 )
 
 # Setup basic logging
+_handlers: List[logging.Handler] = [logging.StreamHandler()]
+try:
+    _handlers.append(logging.FileHandler("aibot.log", encoding="utf-8"))
+except Exception:
+    pass
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.FileHandler("aibot.log", encoding="utf-8")]
+    handlers=_handlers
 )
 logger = logging.getLogger("aibot")
 
@@ -54,21 +63,95 @@ class BotApp:
         self.hw = HardwareMonitor()
         self.news_monitor = TeamworkMonitor()
         self.tmux = TmuxBridge()
+        self.active_tmux_target: Optional[str] = None
+        self.active_tmux_name: Optional[str] = None
+        self.startup_time = time.time()
+        self.lock_file = None
 
         self.last_chat_id: Optional[int] = None
         self.pending_choices: Dict[int, str] = {} # choice_index -> choice_value
         self.is_processing = False
         self._shutdown_event = asyncio.Event()
         self.teamwork_watcher_task: Optional[asyncio.Task] = None
+        self.current_reply_menu: str = "main"
 
-    def get_reply_keyboard(self) -> Dict[str, Any]:
-        """Persistent bottom keyboard for Telegram on mobile/desktop."""
+    def _load_telegram_offset(self) -> int:
+        """Loads the last processed Telegram update_id offset from disk."""
+        try:
+            if os.path.exists(".telegram_offset"):
+                with open(".telegram_offset", "r") as f:
+                    content = f.read().strip()
+                    if content.isdigit():
+                        return int(content)
+        except Exception:
+            pass
+        return 0
+
+    def _save_telegram_offset(self, offset: int):
+        """Persists the Telegram update_id offset to avoid redelivering processed messages."""
+        try:
+            with open(".telegram_offset", "w") as f:
+                f.write(str(offset))
+        except Exception:
+            pass
+
+    def get_reply_keyboard(self, menu: Optional[str] = None) -> Dict[str, Any]:
+        """Persistent bottom keyboard for Telegram on mobile/desktop with sub-menus."""
+        if not self.client:
+            return {}
+        if getattr(self, "active_tmux_target", None):
+            return self.client.build_reply_keyboard([
+                ["👁️ Schermo", "🔄 Aggiorna"],
+                ["🛑 Ctrl+C", "⏎ Invio"],
+                ["1", "2", "3", "y", "n"],
+                ["🔙 Sgancia (Torna al Bot)"]
+            ], resize_keyboard=True, is_persistent=True)
+
+        if menu:
+            self.current_reply_menu = menu
+        active_menu = getattr(self, "current_reply_menu", "main")
+
+        if active_menu == "media":
+            return self.client.build_reply_keyboard([
+                ["⏮️ Prec", "⏯️ Play/Pausa", "⏭️ Succ"],
+                ["🔉 Vol -", "🔊 Vol +", "🔇 Muto"],
+                ["🔄 Aggiorna Media", "🔙 Menu Principale"]
+            ], resize_keyboard=True, is_persistent=True)
+
+        elif active_menu == "screen":
+            return self.client.build_reply_keyboard([
+                ["💡 Accendi Schermo", "💤 Spegni Schermo"],
+                ["🔒 Blocca PC", "🔓 Sblocca PC"],
+                ["🔙 Menu Principale"]
+            ], resize_keyboard=True, is_persistent=True)
+
+        elif active_menu in ["system", "hardware"]:
+            return self.client.build_reply_keyboard([
+                ["📊 Hardware", "⚡ Consumi"],
+                ["📜 Cronologia", "📊 Stato"],
+                ["🔄 Aggiorna Metriche", "🔙 Menu Principale"]
+            ], resize_keyboard=True, is_persistent=True)
+
+        elif active_menu == "agy":
+            return self.client.build_reply_keyboard([
+                ["📊 Quota Usage", "💳 Crediti G1"],
+                ["🔌 MCP Servers", "⚡ Skills", "🤖 Agenti"],
+                ["🧠 Modello AI", "🔙 Menu Principale"]
+            ], resize_keyboard=True, is_persistent=True)
+
+        elif active_menu == "tmux":
+            return self.client.build_reply_keyboard([
+                ["🖥️ Sessioni Agy", "💻 Tutte le Sessioni"],
+                ["📰 Teamwork News", "🔙 Menu Principale"]
+            ], resize_keyboard=True, is_persistent=True)
+
+        # Default main menu
+        self.current_reply_menu = "main"
         return self.client.build_reply_keyboard([
             ["🛑 Stop", "➕ Nuova Chat"],
-            ["📜 Cronologia", "📊 Hardware"],
-            ["⚡ Consumi", "🖥️ Schermo"],
-            ["🎵 Media", "🖥️ Tmux Agy"],
-            ["🎛️ Opzioni Agy", "📋 Menu"]
+            ["🎵 Media", "🖥️ Schermo"],
+            ["📊 Sistema", "🎛️ Opzioni Agy"],
+            ["🖥️ Tmux Agy", "📋 Menu"]
         ], resize_keyboard=True, is_persistent=True)
 
     def get_inline_menu(self) -> Dict[str, Any]:
@@ -218,14 +301,24 @@ class BotApp:
                 return False
 
         self.client = TelegramClient(self.config.bot_token)
-        me = await self.client.get_me()
+        me = None
+        for attempt in range(1, 6):
+            me = await self.client.get_me()
+            if me:
+                break
+            if attempt < 5:
+                self.ui.log_warn(f"Failed to connect to Telegram (attempt {attempt}/5). Retrying in 2s...")
+                await asyncio.sleep(2)
+
         if not me:
             self.ui.log_error("Failed to connect to Telegram. Please check your BOT TOKEN and internet connection.")
+            if self.client:
+                await self.client.close()
             return False
 
         bot_username = me.get("username", "UnknownBot")
 
-        # Register official bot commands in Telegram
+        # Register official bot commands in Telegram (only if changed or not registered yet)
         bot_commands = [
             {"command": "menu", "description": "📋 Mostra il menu principale e pulsanti"},
             {"command": "stop", "description": "🛑 Ferma l'attività in corso"},
@@ -247,7 +340,23 @@ class BotApp:
             {"command": "skills", "description": "⚡ Skill disponibili in Antigravity"},
             {"command": "model", "description": "🧠 Visualizza o cambia il modello AI"}
         ]
-        await self.client.set_my_commands(bot_commands)
+        cmd_hash = hashlib.md5(json.dumps(bot_commands, sort_keys=True).encode()).hexdigest()
+        prev_hash = ""
+        try:
+            if os.path.exists(".commands_hash"):
+                with open(".commands_hash", "r") as f:
+                    prev_hash = f.read().strip()
+        except Exception:
+            pass
+
+        if cmd_hash != prev_hash:
+            res = await self.client.set_my_commands(bot_commands)
+            if res:
+                try:
+                    with open(".commands_hash", "w") as f:
+                        f.write(cmd_hash)
+                except Exception:
+                    pass
 
         self.engine = AgyEngine(
             agy_path=self.config.agy_path,
@@ -416,7 +525,7 @@ class BotApp:
                 await self.client.send_message(
                     target_chat,
                     msg,
-                    reply_markup=self.get_reply_keyboard(),
+                    reply_markup=self.get_reply_keyboard("screen"),
                     parse_mode="Markdown"
                 )
             else:
@@ -427,7 +536,7 @@ class BotApp:
                 await self.client.send_message(
                     target_chat,
                     msg,
-                    reply_markup=self.get_reply_keyboard(),
+                    reply_markup=self.get_reply_keyboard("screen"),
                     parse_mode="Markdown"
                 )
             else:
@@ -438,7 +547,7 @@ class BotApp:
                 await self.client.send_message(
                     target_chat,
                     msg,
-                    reply_markup=self.get_reply_keyboard(),
+                    reply_markup=self.get_reply_keyboard("screen"),
                     parse_mode="Markdown"
                 )
             else:
@@ -449,27 +558,17 @@ class BotApp:
                 await self.client.send_message(
                     target_chat,
                     msg,
-                    reply_markup=self.get_reply_keyboard(),
+                    reply_markup=self.get_reply_keyboard("screen"),
                     parse_mode="Markdown"
                 )
             else:
                 self.ui.log_info(msg.replace("*", "").replace("`", ""))
         else:
-            kb = self.client.build_inline_keyboard([
-                [
-                    {"text": "💤 Spegni Schermo", "callback_data": "menu:screen_off"},
-                    {"text": "💡 Accendi Schermo", "callback_data": "menu:screen_on"}
-                ],
-                [
-                    {"text": "🔓 Sblocca Schermo", "callback_data": "menu:screen_unlock"},
-                    {"text": "🔒 Blocca Schermo", "callback_data": "menu:screen_lock"}
-                ]
-            ])
             if target_chat and self.client:
                 await self.client.send_message(
                     target_chat,
-                    "🖥️ *Controllo Schermo PC*\nScegli un'azione per il display del PC:",
-                    reply_markup=kb,
+                    "🖥️ *Controllo Schermo PC*\nUsa i pulsanti in basso per controllare il display o bloccare la sessione:",
+                    reply_markup=self.get_reply_keyboard("screen"),
                     parse_mode="Markdown"
                 )
             else:
@@ -518,12 +617,12 @@ class BotApp:
         """Displays media player & volume controller."""
         target_chat = chat_id or self.last_chat_id
         report = await asyncio.to_thread(self.media.get_media_report)
-        kb = self.get_media_keyboard() if self.client else None
         if target_chat and self.client:
             if message_id:
+                kb = self.get_media_keyboard()
                 await self.client.edit_message_text(chat_id=target_chat, message_id=message_id, text=report, reply_markup=kb, parse_mode="Markdown")
             else:
-                await self.client.send_message(target_chat, text=report, reply_markup=kb, parse_mode="Markdown")
+                await self.client.send_message(target_chat, text=report, reply_markup=self.get_reply_keyboard("media"), parse_mode="Markdown")
         else:
             self.ui.log_info(report.replace("*", "").replace("`", ""))
 
@@ -531,12 +630,12 @@ class BotApp:
         """Displays real-time hardware status."""
         target_chat = chat_id or self.last_chat_id
         report = await asyncio.to_thread(self.hw.get_hardware_report)
-        kb = self.get_hardware_keyboard() if self.client else None
         if target_chat and self.client:
             if message_id:
+                kb = self.get_hardware_keyboard()
                 await self.client.edit_message_text(chat_id=target_chat, message_id=message_id, text=report, reply_markup=kb, parse_mode="Markdown")
             else:
-                await self.client.send_message(target_chat, text=report, reply_markup=kb, parse_mode="Markdown")
+                await self.client.send_message(target_chat, text=report, reply_markup=self.get_reply_keyboard("system"), parse_mode="Markdown")
         else:
             self.ui.log_info(report.replace("*", "").replace("`", ""))
 
@@ -556,23 +655,74 @@ class BotApp:
         else:
             self.ui.log_info(report.replace("*", "").replace("`", ""))
 
-    async def cmd_tmux(self, chat_id: Optional[int] = None, message_id: Optional[int] = None):
-        """Displays all running agy sessions in tmux with action buttons."""
+    def _build_tmux_screen_keyboard(self, target: str) -> Dict[str, Any]:
+        """Builds an interactive control keyboard for a tmux session screen."""
+        if not self.client:
+            return {}
+        target_str = str(target or "")
+        is_attached = bool(target_str and getattr(self, "active_tmux_target", None) == target_str)
+        attach_btn = (
+            {"text": "🔓 Sgancia", "callback_data": "tmux:detach"}
+            if is_attached
+            else {"text": "🎯 Aggancia e Scrivi", "callback_data": f"tmux:attach:{target}"}
+        )
+        return self.client.build_inline_keyboard([
+            [
+                {"text": "🔄 Aggiorna Schermo", "callback_data": f"tmux:screen:{target}"},
+                attach_btn
+            ],
+            [
+                {"text": "🛑 Ctrl+C", "callback_data": f"tmux:key:{target}:C-c"},
+                {"text": "⏎ Invio", "callback_data": f"tmux:key:{target}:Enter"}
+            ],
+            [
+                {"text": "1", "callback_data": f"tmux:send:{target}:1"},
+                {"text": "2", "callback_data": f"tmux:send:{target}:2"},
+                {"text": "3", "callback_data": f"tmux:send:{target}:3"},
+                {"text": "y", "callback_data": f"tmux:send:{target}:y"},
+                {"text": "n", "callback_data": f"tmux:send:{target}:n"}
+            ],
+            [
+                {"text": "🗑️ Chiudi Sessione", "callback_data": f"tmux:kill_ask:{target}"},
+                {"text": "🔙 Lista Sessioni", "callback_data": "menu:tmux"}
+            ],
+            [
+                {"text": "🏠 Menu Principale", "callback_data": "menu:main"}
+            ]
+        ])
+
+    async def cmd_tmux(self, chat_id: Optional[int] = None, message_id: Optional[int] = None, show_all: bool = False):
+        """Displays running sessions in tmux with action buttons."""
         target_chat = chat_id or self.last_chat_id
-        report = await asyncio.to_thread(self.tmux.format_sessions_card)
-        sessions = await asyncio.to_thread(self.tmux.discover_agy_sessions)
+        report = await asyncio.to_thread(self.tmux.format_sessions_card, only_agy=not show_all)
+        sessions = await asyncio.to_thread(self.tmux.discover_sessions, only_agy=not show_all, include_aibot=show_all)
 
         keyboard_rows = []
         for s in sessions:
-            w_name = s["window_name"]
-            target = s["target"]
+            target = str(s.get("target") or "")
+            w_name = str(s.get("window_name") or s.get("name") or target or "tmux")
+            icon = "🪐" if s.get("is_agy") else "💻"
+            is_active = bool(target and getattr(self, "active_tmux_target", None) == target)
+            attach_btn_text = f"🔓 Connesso (Sgancia)" if is_active else f"🎯 Aggancia {w_name}"
+            attach_cb = "tmux:detach" if is_active else f"tmux:attach:{target}"
             keyboard_rows.append([
-                {"text": f"👁️ Schermo: {w_name}", "callback_data": f"tmux:screen:{target}"},
-                {"text": f"✍️ Invia Input: {w_name}", "callback_data": f"tmux:prompt:{target}"}
+                {"text": f"👁️ Schermo: {icon} {w_name}", "callback_data": f"tmux:screen:{target}"},
+                {"text": attach_btn_text, "callback_data": attach_cb}
             ])
+
+        filter_btn = (
+            {"text": "🔍 Mostra: Tutte le Sessioni", "callback_data": "tmux:view:all"}
+            if not show_all
+            else {"text": "🔍 Mostra: Solo Agy", "callback_data": "tmux:view:agy"}
+        )
+        refresh_cb = "tmux:refresh:all" if show_all else "tmux:refresh:agy"
+
         keyboard_rows.append([
-            {"text": "➕ Nuova Sessione Tmux", "callback_data": "tmux:new_session"},
-            {"text": "🔄 Aggiorna", "callback_data": "tmux:refresh"},
+            filter_btn,
+            {"text": "➕ Nuova Sessione Tmux", "callback_data": "tmux:new_session"}
+        ])
+        keyboard_rows.append([
+            {"text": "🔄 Aggiorna", "callback_data": refresh_cb},
             {"text": "🔙 Menu", "callback_data": "menu:main"}
         ])
         kb = self.client.build_inline_keyboard(keyboard_rows) if self.client else None
@@ -585,16 +735,23 @@ class BotApp:
         else:
             self.ui.log_info(report.replace("*", "").replace("`", ""))
 
-    async def cmd_tmux_screen(self, target: str, chat_id: Optional[int] = None):
-        """Captures recent lines of a tmux pane and sends it as formatted code block."""
+    async def cmd_tmux_screen(self, target: str, chat_id: Optional[int] = None, message_id: Optional[int] = None):
+        """Captures recent lines of a tmux pane and sends/edits it as formatted code block with interactive controls."""
         target_chat = chat_id or self.last_chat_id
-        screen = await asyncio.to_thread(self.tmux.capture_session_screen, target, 25)
-        text = f"🖥️ *Live Screen tmux (`{target}`):*\n```text\n{screen}\n```"
-        kb = self.client.build_inline_keyboard([
-            [{"text": "🔄 Aggiorna Schermo", "callback_data": f"tmux:screen:{target}"}],
-            [{"text": "🔙 Tutte le Sessioni", "callback_data": "menu:tmux"}]
-        ]) if self.client else None
+        target_str = str(target or "")
+        screen = await asyncio.to_thread(self.tmux.capture_session_screen, target_str, 25)
+        safe_screen = screen.replace("```", "'''")[:3500]
+        is_attached = bool(target_str and getattr(self, "active_tmux_target", None) == target_str)
+        focus_label = "🎯 *Agganciata:* ogni messaggio in chat andrà qui!" if is_attached else "⚪ *Non agganciata:* usa '🎯 Aggancia' per scrivere da chat"
+        text = f"🖥️ *Live Screen tmux (`{target}`):*\n{focus_label}\n```text\n{safe_screen}\n```"
+        kb = self._build_tmux_screen_keyboard(target) if self.client else None
         if target_chat and self.client:
+            if message_id:
+                try:
+                    await self.client.edit_message_text(chat_id=target_chat, message_id=message_id, text=text, reply_markup=kb, parse_mode="Markdown")
+                    return
+                except Exception:
+                    pass
             await self.client.send_message(target_chat, text, reply_markup=kb, parse_mode="Markdown")
         else:
             self.ui.log_info(screen)
@@ -610,11 +767,15 @@ class BotApp:
             return
 
         dest, input_text = parts[0], parts[1]
-        sessions = await asyncio.to_thread(self.tmux.discover_agy_sessions)
+        sessions = await asyncio.to_thread(self.tmux.discover_all_sessions, include_aibot=True)
         target = dest
         for s in sessions:
-            if s["window_name"].lower() == dest.lower() or s["target"] == dest:
-                target = s["target"]
+            s_target = str(s.get("target") or "")
+            s_wname = str(s.get("window_name") or "")
+            s_sname = str(s.get("session_name") or s.get("name") or (s_target.split(":")[0] if ":" in s_target else s_target))
+            candidates = [str(c).lower() for c in [s_target, s_wname, s_sname, s.get("name")] if c is not None and str(c).strip()]
+            if dest.lower() in candidates or (s_target and dest == s_target):
+                target = s_target
                 break
 
         success = await asyncio.to_thread(self.tmux.send_input, target, input_text)
@@ -633,14 +794,14 @@ class BotApp:
         target_chat = chat_id or self.last_chat_id
         text = (
             "🎛️ *Opzioni e Strumenti da Terminale Antigravity (Agy)*\n\n"
-            "Seleziona un'opzione per visualizzare statistiche in tempo reale o scoprire come usare i workflow avanzati:"
+            "Usa i pulsanti in basso per visualizzare statistiche, crediti, server MCP e configurazioni:"
         )
-        kb = self.get_agy_options_keyboard()
         if target_chat and self.client:
             if message_id:
+                kb = self.get_agy_options_keyboard()
                 await self.client.edit_message_text(chat_id=target_chat, message_id=message_id, text=text, reply_markup=kb, parse_mode="Markdown")
             else:
-                await self.client.send_message(target_chat, text, reply_markup=kb, parse_mode="Markdown")
+                await self.client.send_message(target_chat, text, reply_markup=self.get_reply_keyboard("agy"), parse_mode="Markdown")
         else:
             self.ui.log_info("Agy options available via Telegram or /help")
 
@@ -656,7 +817,7 @@ class BotApp:
             if message_id:
                 await self.client.edit_message_text(chat_id=target_chat, message_id=message_id, text=report, reply_markup=kb, parse_mode="Markdown")
             else:
-                await self.client.send_message(target_chat, report, reply_markup=kb, parse_mode="Markdown")
+                await self.client.send_message(target_chat, report, reply_markup=self.get_reply_keyboard("agy"), parse_mode="Markdown")
         else:
             self.ui.log_info(report.replace("*", "").replace("`", ""))
 
@@ -672,7 +833,7 @@ class BotApp:
             if message_id:
                 await self.client.edit_message_text(chat_id=target_chat, message_id=message_id, text=report, reply_markup=kb, parse_mode="Markdown")
             else:
-                await self.client.send_message(target_chat, report, reply_markup=kb, parse_mode="Markdown")
+                await self.client.send_message(target_chat, report, reply_markup=self.get_reply_keyboard("agy"), parse_mode="Markdown")
         else:
             self.ui.log_info(report.replace("*", "").replace("`", ""))
 
@@ -688,7 +849,7 @@ class BotApp:
             if message_id:
                 await self.client.edit_message_text(chat_id=target_chat, message_id=message_id, text=report, reply_markup=kb, parse_mode="Markdown")
             else:
-                await self.client.send_message(target_chat, report, reply_markup=kb, parse_mode="Markdown")
+                await self.client.send_message(target_chat, report, reply_markup=self.get_reply_keyboard("agy"), parse_mode="Markdown")
         else:
             self.ui.log_info(report.replace("*", "").replace("`", ""))
 
@@ -704,7 +865,7 @@ class BotApp:
             if message_id:
                 await self.client.edit_message_text(chat_id=target_chat, message_id=message_id, text=report, reply_markup=kb, parse_mode="Markdown")
             else:
-                await self.client.send_message(target_chat, report, reply_markup=kb, parse_mode="Markdown")
+                await self.client.send_message(target_chat, report, reply_markup=self.get_reply_keyboard("agy"), parse_mode="Markdown")
         else:
             self.ui.log_info(report.replace("*", "").replace("`", ""))
 
@@ -720,7 +881,7 @@ class BotApp:
             if message_id:
                 await self.client.edit_message_text(chat_id=target_chat, message_id=message_id, text=report, reply_markup=kb, parse_mode="Markdown")
             else:
-                await self.client.send_message(target_chat, report, reply_markup=kb, parse_mode="Markdown")
+                await self.client.send_message(target_chat, report, reply_markup=self.get_reply_keyboard("agy"), parse_mode="Markdown")
         else:
             self.ui.log_info(report.replace("*", "").replace("`", ""))
 
@@ -1028,14 +1189,15 @@ class BotApp:
 
     async def poll_telegram(self):
         """Continuously polls Telegram for incoming messages and button clicks."""
-        offset = 0
-        self.ui.log_info("Telegram polling started.")
+        offset = self._load_telegram_offset()
+        self.ui.log_info(f"Telegram polling started (offset: {offset}).")
 
         while not self._shutdown_event.is_set():
             try:
                 updates = await self.client.get_updates(offset=offset, timeout=20)
                 for update in updates:
                     offset = update["update_id"] + 1
+                    self._save_telegram_offset(offset)
                     await self.process_telegram_update(update)
             except asyncio.CancelledError:
                 break
@@ -1255,8 +1417,13 @@ class BotApp:
             elif data == "news:refresh":
                 await self.cmd_news(chat_id, message_id=msg.get("message_id"))
                 return
-            elif data == "menu:tmux" or data == "tmux:refresh":
-                await self.cmd_tmux(chat_id, message_id=msg.get("message_id"))
+            elif data in ["menu:tmux", "tmux:refresh", "tmux:refresh:agy", "tmux:view:agy"]:
+                self.current_reply_menu = "tmux"
+                await self.cmd_tmux(chat_id, message_id=msg.get("message_id"), show_all=False)
+                return
+            elif data in ["tmux:view:all", "tmux:refresh:all"]:
+                self.current_reply_menu = "tmux"
+                await self.cmd_tmux(chat_id, message_id=msg.get("message_id"), show_all=True)
                 return
             elif data == "tmux:new_session":
                 sname = await asyncio.to_thread(
@@ -1265,31 +1432,121 @@ class BotApp:
                     window_name="agy"
                 )
                 if sname:
-                    await self.client.answer_callback_query(query_id, f"✅ Creata sessione tmux: {sname}", show_alert=True)
+                    await self.client.answer_callback_query(cq_id, f"✅ Creata sessione tmux: {sname}", show_alert=True)
                 else:
-                    await self.client.answer_callback_query(query_id, "❌ Impossibile creare sessione tmux", show_alert=True)
+                    await self.client.answer_callback_query(cq_id, "❌ Impossibile creare sessione tmux", show_alert=True)
                 await self.cmd_tmux(chat_id, message_id=msg.get("message_id"))
                 return
             elif data.startswith("tmux:screen:"):
                 t_target = data.split(":", 2)[2]
-                await self.cmd_tmux_screen(t_target, chat_id)
+                await self.cmd_tmux_screen(t_target, chat_id, message_id=msg.get("message_id"))
+                return
+            elif data.startswith("tmux:attach:") or data.startswith("tmux:prompt:"):
+                parts = data.split(":", 2)
+                t_target = parts[2] if len(parts) >= 3 else ""
+                sessions = await asyncio.to_thread(self.tmux.discover_all_sessions, include_aibot=True)
+                w_name = t_target or "session"
+                target_session = t_target.split(":")[0] if ":" in t_target else t_target
+
+                # Two-pass resolution: prioritize exact target match first, then fall back to session name matching
+                matched = None
+                if t_target:
+                    # Pass 1: exact target match
+                    for s in sessions:
+                        if str(s.get("target") or "") == t_target:
+                            matched = s
+                            break
+                    # Pass 2: fallback to session name match
+                    if not matched:
+                        for s in sessions:
+                            s_target = str(s.get("target") or "")
+                            s_sname = str(s.get("session_name") or s.get("name") or (s_target.split(":")[0] if ":" in s_target else s_target))
+                            if s_sname == target_session:
+                                matched = s
+                                break
+
+                if matched:
+                    t_target = str(matched.get("target") or t_target)
+                    w_name = str(matched.get("window_name") or matched.get("name") or t_target or "session")
+
+                self.active_tmux_target = t_target if t_target else None
+                self.active_tmux_name = w_name if t_target else None
+                await self.client.answer_callback_query(cq_id, f"🎯 Agganciato a {w_name}!", show_alert=False)
+                await self.client.send_message(
+                    chat_id,
+                    f"🎯 *Sessione tmux agganciata:* `{w_name}` (`{t_target}`)\n\n"
+                    f"• Ora puoi digitare qualsiasi messaggio in chat per inviarlo direttamente a questo terminale.\n"
+                    f"• Usa i pulsanti per comandi rapidi (Ctrl+C, Invio, Schermo).\n"
+                    f"• Premi *🔙 Sgancia (Torna al Bot)* o scrivi `/detach` per tornare alla modalità bot.",
+                    reply_markup=self.get_reply_keyboard(),
+                    parse_mode="Markdown"
+                )
+                await self.cmd_tmux_screen(t_target, chat_id=chat_id)
+                return
+            elif data == "tmux:detach":
+                t_name = self.active_tmux_name or self.active_tmux_target or "sessione"
+                self.active_tmux_target = None
+                self.active_tmux_name = None
+                self.current_reply_menu = "main"
+                await self.client.answer_callback_query(cq_id, "🔓 Sessione sganciata", show_alert=False)
+                await self.client.send_message(
+                    chat_id,
+                    f"🔓 *Sganciato da:* `{t_name}`\nSei tornato alla chat principale del bot.",
+                    reply_markup=self.get_reply_keyboard("main"),
+                    parse_mode="Markdown"
+                )
+                return
+            elif data.startswith("tmux:key:"):
+                payload = data[len("tmux:key:"):]
+                if ":" in payload:
+                    t_target, t_key = payload.rsplit(":", 1)
+                    if t_target and t_key:
+                        await asyncio.to_thread(self.tmux.send_key, t_target, t_key)
+                        await self.client.answer_callback_query(cq_id, f"Inviato: {t_key}")
+                        await asyncio.sleep(0.5)
+                        await self.cmd_tmux_screen(t_target, chat_id, message_id=msg.get("message_id"))
                 return
             elif data.startswith("tmux:send:"):
-                parts = data.split(":", 3)
-                if len(parts) >= 4:
-                    t_target = parts[2]
-                    t_val = parts[3]
-                    success = await asyncio.to_thread(self.tmux.send_input, t_target, t_val)
-                    if msg.get("message_id"):
-                        await self.client.edit_message_text(
-                            chat_id=chat_id,
-                            message_id=msg["message_id"],
-                            text=f"✅ Risposta `{t_val}` inviata a tmux (`{t_target}`)",
-                            reply_markup=None,
-                            parse_mode="Markdown"
-                        )
+                payload = data[len("tmux:send:"):]
+                if ":" in payload:
+                    t_target, t_val = payload.rsplit(":", 1)
+                    if t_target and t_val:
+                        await asyncio.to_thread(self.tmux.send_input, t_target, t_val)
+                        await self.client.answer_callback_query(cq_id, f"Inviato: {t_val}")
+                        await asyncio.sleep(0.5)
+                        await self.cmd_tmux_screen(t_target, chat_id, message_id=msg.get("message_id"))
+                return
+            elif data.startswith("tmux:kill_ask:"):
+                t_target = data.split(":", 2)[2]
+                confirm_kb = self.client.build_inline_keyboard([
+                    [
+                        {"text": "⚠️ Sì, Termina Sessione", "callback_data": f"tmux:kill_confirm:{t_target}"},
+                        {"text": "❌ Annulla", "callback_data": f"tmux:screen:{t_target}"}
+                    ]
+                ])
+                if msg.get("message_id"):
+                    await self.client.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=msg["message_id"],
+                        text=f"⚠️ *Sei sicuro di voler chiudere la sessione tmux (`{t_target}`)?*\nI processi in esecuzione in questa sessione verranno interrotti.",
+                        reply_markup=confirm_kb,
+                        parse_mode="Markdown"
+                    )
+                return
+            elif data.startswith("tmux:kill_confirm:"):
+                t_target = data.split(":", 2)[2]
+                success = await asyncio.to_thread(self.tmux.kill_session, t_target)
+                if self.active_tmux_target == t_target:
+                    self.active_tmux_target = None
+                    self.active_tmux_name = None
+                if success:
+                    await self.client.answer_callback_query(cq_id, f"✅ Sessione {t_target} chiusa", show_alert=True)
+                else:
+                    await self.client.answer_callback_query(cq_id, "❌ Impossibile chiudere la sessione", show_alert=True)
+                await self.cmd_tmux(chat_id, message_id=msg.get("message_id"))
                 return
             elif data == "menu:main":
+                self.current_reply_menu = "main"
                 if msg.get("message_id"):
                     await self.client.edit_message_text(
                         chat_id=chat_id,
@@ -1410,6 +1667,130 @@ class BotApp:
 
             text_lower = text.lower().strip()
 
+            # Handle Active Tmux Session routing
+            if getattr(self, "active_tmux_target", None):
+                target = self.active_tmux_target
+                target_name = self.active_tmux_name or target
+
+                escape_commands = [
+                    "/detach", "detach", "sgancia", "🔙 sgancia (torna al bot)", "/unfocus", "esci",
+                    "/menu", "menu", "🔙 menu principale", "🔙 menu", "🔙 indietro", "indietro", "/start", "start"
+                ]
+                if text_lower in escape_commands:
+                    self.active_tmux_target = None
+                    self.active_tmux_name = None
+                    self.current_reply_menu = "main"
+                    await self.client.send_message(
+                        chat_id,
+                        f"🔓 *Sganciato da:* `{target_name}`\nSei tornato alla chat principale con il bot.",
+                        reply_markup=self.get_reply_keyboard("main"),
+                        parse_mode="Markdown"
+                    )
+                    if text_lower in ["/menu", "menu", "🔙 menu principale", "🔙 menu", "🔙 indietro", "indietro"]:
+                        await self.cmd_menu(chat_id)
+                    return
+
+                if text in ["👁️ Schermo", "🔄 Aggiorna", "/screen"]:
+                    await self.cmd_tmux_screen(target, chat_id=chat_id)
+                    return
+
+                if text in ["🛑 Ctrl+C", "ctrl+c", "/stop"]:
+                    await asyncio.to_thread(self.tmux.send_key, target, "C-c")
+                    await asyncio.sleep(0.5)
+                    await self.cmd_tmux_screen(target, chat_id=chat_id)
+                    return
+
+                if text in ["⏎ Invio", "invio", "enter"]:
+                    await asyncio.to_thread(self.tmux.send_key, target, "Enter")
+                    await asyncio.sleep(0.5)
+                    await self.cmd_tmux_screen(target, chat_id=chat_id)
+                    return
+
+                # Forward regular message or quick choice to the tmux session
+                self.ui.log_telegram_in(user_name, f"[Forwarding to tmux {target_name}]: {text}")
+                await asyncio.to_thread(self.tmux.send_input, target, text)
+                await asyncio.sleep(0.7)
+                await self.cmd_tmux_screen(target, chat_id=chat_id)
+                return
+
+            if text_lower == "/attach" or text_lower == "/focus":
+                await self.client.send_message(
+                    chat_id,
+                    "ℹ️ *Uso comando:* `/attach <nome_sessione>`\nUsa `/tmux` per visualizzare le sessioni attive.",
+                    reply_markup=self.get_reply_keyboard(),
+                    parse_mode="Markdown"
+                )
+                return
+
+            if text_lower.startswith("/attach ") or text_lower.startswith("/focus "):
+                parts = text.split(maxsplit=1)
+                if len(parts) < 2 or not parts[1].strip():
+                    await self.client.send_message(
+                        chat_id,
+                        "ℹ️ *Uso comando:* `/attach <nome_sessione>`\nUsa `/tmux` per visualizzare le sessioni attive.",
+                        reply_markup=self.get_reply_keyboard(),
+                        parse_mode="Markdown"
+                    )
+                    return
+                target_arg = parts[1].strip()
+                sessions = await asyncio.to_thread(self.tmux.discover_all_sessions, include_aibot=True)
+                found = None
+                for s in sessions:
+                    s_target = str(s.get("target") or "")
+                    s_wname = str(s.get("window_name") or "")
+                    s_sname = str(s.get("session_name") or s.get("name") or (s_target.split(":")[0] if ":" in s_target else s_target))
+                    candidate_names = [str(c) for c in [s_target, s_wname, s_sname, s.get("name")] if c is not None and str(c).strip()]
+                    if target_arg in candidate_names or target_arg.lower() in [c.lower() for c in candidate_names]:
+                        found = s
+                        break
+                if found:
+                    found_target = str(found.get("target") or found.get("session_name") or target_arg)
+                    found_name = str(found.get("window_name") or found.get("name") or found_target)
+                    self.active_tmux_target = found_target
+                    self.active_tmux_name = found_name
+                    await self.client.send_message(
+                        chat_id,
+                        f"🎯 *Sessione tmux agganciata:* `{found_name}` (`{found_target}`)\n"
+                        f"I messaggi digitati in questa chat verranno inoltrati direttamente al terminale.\n"
+                        f"Premi *🔙 Sgancia (Torna al Bot)* o scrivi `/detach` per disconnetterti.",
+                        reply_markup=self.get_reply_keyboard(),
+                        parse_mode="Markdown"
+                    )
+                    await self.cmd_tmux_screen(found_target, chat_id=chat_id)
+                else:
+                    await self.client.send_message(
+                        chat_id,
+                        f"❌ *Sessione `{target_arg}` non trovata.* Usa `/tmux` per visualizzare le sessioni disponibili.",
+                        reply_markup=self.get_reply_keyboard(),
+                        parse_mode="Markdown"
+                    )
+                return
+
+            if text_lower in ["/detach", "detach", "sgancia", "🔙 sgancia (torna al bot)", "sgancia (torna al bot)"]:
+                if getattr(self, "active_tmux_target", None):
+                    t_name = self.active_tmux_name or self.active_tmux_target
+                    self.active_tmux_target = None
+                    self.active_tmux_name = None
+                    self.current_reply_menu = "main"
+                    await self.client.send_message(chat_id, f"🔓 *Sganciato da:* `{t_name}`\nSei tornato alla chat principale del bot.", reply_markup=self.get_reply_keyboard("main"), parse_mode="Markdown")
+                else:
+                    self.current_reply_menu = "main"
+                    await self.client.send_message(chat_id, "ℹ️ *Tastiera ripristinata al Menu Principale.*", reply_markup=self.get_reply_keyboard("main"), parse_mode="Markdown")
+                return
+
+            # Prevent tmux terminal shortcuts from leaking into agy prompts if session is not active
+            orphaned_tmux_buttons = ["👁️ Schermo", "🔄 Aggiorna", "🛑 Ctrl+C", "⏎ Invio"]
+            if not getattr(self, "active_tmux_target", None):
+                if text in orphaned_tmux_buttons or (getattr(self, "current_reply_menu", "main") == "tmux" and text in ["1", "2", "3", "y", "n"]):
+                    self.current_reply_menu = "main"
+                    await self.client.send_message(
+                        chat_id,
+                        "ℹ️ *Nessuna sessione tmux attiva.* Tastiera ripristinata al Menu Principale.",
+                        reply_markup=self.get_reply_keyboard("main"),
+                        parse_mode="Markdown"
+                    )
+                    return
+
             # Commands & Button Presses
             if text_lower in ["/start", "start"]:
                 welcome = (
@@ -1422,7 +1803,58 @@ class BotApp:
                 await self.client.send_message(
                     chat_id,
                     welcome,
-                    reply_markup=self.get_reply_keyboard(),
+                    reply_markup=self.get_reply_keyboard("main"),
+                    parse_mode="Markdown"
+                )
+                return
+
+            if text_lower in ["/restart", "restart", "riavvia", "/riavvia"]:
+                msg_date = msg.get("date", 0)
+                # If message was sent before bot process startup, ignore to prevent stale restart loops
+                if msg_date and msg_date < (self.startup_time - 2):
+                    self.ui.log_warn(
+                        f"Ignoring stale restart command from Telegram (msg date: {msg_date}, startup: {int(self.startup_time)})"
+                    )
+                    return
+
+                await self.client.send_message(
+                    chat_id,
+                    "🔄 *Riavvio in corso...*\nIl bot si sta riavviando con il codice aggiornato.",
+                    reply_markup=self.get_reply_keyboard("main"),
+                    parse_mode="Markdown"
+                )
+                self.ui.log_info("Restart requested via Telegram")
+
+                # CRITICAL: Acknowledge the restart update so Telegram doesn't redeliver it in an infinite loop!
+                update_id = update.get("update_id")
+                if update_id is not None:
+                    self._save_telegram_offset(update_id + 1)
+                    try:
+                        await self.client.get_updates(offset=update_id + 1, timeout=0)
+                    except Exception as e:
+                        logger.warning(f"Failed to acknowledge offset before restart: {e}")
+
+                if getattr(self, "lock_file", None):
+                    try:
+                        fcntl.flock(self.lock_file, fcntl.LOCK_UN)
+                        self.lock_file.close()
+                    except Exception:
+                        pass
+
+                if self.client:
+                    await self.client.close()
+                self.ui.stop()
+                await asyncio.sleep(0.5)
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+                return
+
+            # Back / Main Menu button
+            if text_lower in ["🔙 menu principale", "🔙 menu", "🔙 indietro", "🔙 torna al menu", "menu principale", "indietro"]:
+                self.current_reply_menu = "main"
+                await self.client.send_message(
+                    chat_id,
+                    "🏠 *Menu Principale*\nTastiera ripristinata ai comandi primari.",
+                    reply_markup=self.get_reply_keyboard("main"),
                     parse_mode="Markdown"
                 )
                 return
@@ -1443,32 +1875,85 @@ class BotApp:
                 await self.cmd_status(chat_id)
                 return
 
-            if text_lower in ["⚡ consumi", "consumi", "power", "/power", "/consumi"]:
-                await self.cmd_power(chat_id)
-                return
-
-            if text_lower in ["🎵 media", "media", "/media", "/music", "musica", "/player", "/volume", "/vol"]:
-                await self.cmd_media(chat_id)
-                return
-
-            if text_lower in ["📊 hardware", "hardware", "/hardware", "/hw", "/top"]:
+            # System sub-menu
+            if text_lower in ["📊 sistema", "sistema", "/sistema", "/system"]:
+                self.current_reply_menu = "system"
                 await self.cmd_hardware(chat_id)
                 return
 
-            if text_lower in ["📰 news", "news", "/news", "/progetti/news"]:
-                await self.cmd_news(chat_id)
+            if text_lower in ["⚡ consumi", "consumi", "power", "/power", "/consumi"]:
+                self.current_reply_menu = "system"
+                await self.cmd_power(chat_id)
                 return
 
-            if text_lower in ["🖥️ tmux agy", "tmux", "/tmux", "tmux agy", "/sessions"]:
-                await self.cmd_tmux(chat_id)
+            if text_lower in ["📊 hardware", "hardware", "/hardware", "/hw", "/top"]:
+                self.current_reply_menu = "system"
+                await self.cmd_hardware(chat_id)
                 return
 
-            if text_lower.startswith("/send "):
-                arg_val = text[6:].strip()
-                await self.cmd_send(arg_val, chat_id)
+            if text_lower in ["🔄 aggiorna metriche", "aggiorna metriche"]:
+                await self.cmd_hardware(chat_id)
+                return
+
+            # Media sub-menu
+            if text_lower in ["🎵 media", "media", "/media", "/music", "musica", "/player", "/volume", "/vol"]:
+                self.current_reply_menu = "media"
+                await self.cmd_media(chat_id)
+                return
+
+            if text_lower in ["⏮️ prec", "prec", "precedente"]:
+                await asyncio.to_thread(self.media.prev_track)
+                await self.cmd_media(chat_id)
+                return
+
+            if text_lower in ["⏯️ play/pausa", "play/pausa", "play", "pause", "pausa"]:
+                await asyncio.to_thread(self.media.play_pause)
+                await self.cmd_media(chat_id)
+                return
+
+            if text_lower in ["⏭️ succ", "succ", "successivo", "next"]:
+                await asyncio.to_thread(self.media.next_track)
+                await self.cmd_media(chat_id)
+                return
+
+            if text_lower in ["🔉 vol -", "🔉 vol -5%", "vol -", "volume -", "vol-"]:
+                await asyncio.to_thread(self.media.volume_down, 5)
+                await self.cmd_media(chat_id)
+                return
+
+            if text_lower in ["🔊 vol +", "🔊 vol +5%", "vol +", "volume +", "vol+"]:
+                await asyncio.to_thread(self.media.volume_up, 5)
+                await self.cmd_media(chat_id)
+                return
+
+            if text_lower in ["🔇 muto", "muto", "mute"]:
+                await asyncio.to_thread(self.media.toggle_mute)
+                await self.cmd_media(chat_id)
+                return
+
+            if text_lower in ["🔄 aggiorna media", "aggiorna media"]:
+                await self.cmd_media(chat_id)
+                return
+
+            # Screen sub-menu
+            if text_lower in ["💡 accendi schermo", "accendi schermo", "accendi"]:
+                await self.cmd_screen("on", chat_id)
+                return
+
+            if text_lower in ["💤 spegni schermo", "spegni schermo", "spegni"]:
+                await self.cmd_screen("off", chat_id)
+                return
+
+            if text_lower in ["🔒 blocca pc", "blocca pc"]:
+                await self.cmd_screen("lock", chat_id)
+                return
+
+            if text_lower in ["🔓 sblocca pc", "sblocca pc"]:
+                await self.cmd_screen("unlock", chat_id)
                 return
 
             if text_lower.startswith(("/screen", "/schermo", "screen", "schermo", "🖥️ schermo", "🖥️ screen")) or text_lower in ["🖥️ schermo", "schermo", "screen"]:
+                self.current_reply_menu = "screen"
                 parts = text.split(maxsplit=1)
                 arg_val = parts[1] if len(parts) > 1 and not parts[0].startswith("🖥️") else ""
                 await self.cmd_screen(arg_val, chat_id)
@@ -1482,7 +1967,71 @@ class BotApp:
                 await self.cmd_screen("lock", chat_id)
                 return
 
-            if text_lower in ["🧠 modello", "modello", "model", "/model"]:
+            # Tmux sub-menu
+            if text_lower in ["🖥️ sessioni agy", "sessioni agy"]:
+                self.current_reply_menu = "tmux"
+                await self.cmd_tmux(chat_id, show_all=False)
+                return
+
+            if text_lower in ["💻 tutte le sessioni", "/tmux all", "tmux all", "/tmux_all", "tutte le sessioni"]:
+                self.current_reply_menu = "tmux"
+                await self.cmd_tmux(chat_id, show_all=True)
+                return
+
+            if text_lower in ["📰 teamwork news", "📰 news", "news", "/news", "/progetti/news"]:
+                self.current_reply_menu = "tmux"
+                await self.cmd_news(chat_id)
+                return
+
+            if text_lower in ["🖥️ tmux agy", "tmux", "/tmux", "tmux agy", "/sessions"]:
+                self.current_reply_menu = "tmux"
+                await self.client.send_message(
+                    chat_id,
+                    "🖥️ *Navigatore Tmux Agy*\nTastiera inferiore sincronizzata con i comandi Tmux:",
+                    reply_markup=self.get_reply_keyboard("tmux"),
+                    parse_mode="Markdown"
+                )
+                await self.cmd_tmux(chat_id, show_all=False)
+                return
+
+            if text_lower.startswith("/send "):
+                arg_val = text[6:].strip()
+                await self.cmd_send(arg_val, chat_id)
+                return
+
+            # Agy options sub-menu
+            if text_lower in ["🎛️ opzioni agy", "opzioni agy", "opzioni", "/agy", "/opzioni", "/tools", "agy"]:
+                self.current_reply_menu = "agy"
+                await self.cmd_agy_options(chat_id)
+                return
+
+            if text_lower in ["📊 quota usage", "/usage", "/quota", "usage", "quota"]:
+                self.current_reply_menu = "agy"
+                await self.cmd_usage(chat_id)
+                return
+
+            if text_lower in ["💳 crediti g1", "/credits", "credits", "crediti", "/crediti"]:
+                self.current_reply_menu = "agy"
+                await self.cmd_credits(chat_id)
+                return
+
+            if text_lower in ["🔌 mcp servers", "🔌 mcp", "/mcp", "mcp"]:
+                self.current_reply_menu = "agy"
+                await self.cmd_mcp(chat_id)
+                return
+
+            if text_lower in ["⚡ skills", "/skills", "skills"]:
+                self.current_reply_menu = "agy"
+                await self.cmd_skills(chat_id)
+                return
+
+            if text_lower in ["🤖 agenti", "/agents", "agents", "agenti", "/agenti"]:
+                self.current_reply_menu = "agy"
+                await self.cmd_agents(chat_id)
+                return
+
+            if text_lower in ["🧠 modello ai", "🧠 modello", "modello", "model", "/model"]:
+                self.current_reply_menu = "agy"
                 if text_lower.startswith("/model") and len(text.split(maxsplit=1)) > 1:
                     new_model = text.split(maxsplit=1)[1].strip()
                     norm = normalize_model_name(new_model)
@@ -1492,7 +2041,7 @@ class BotApp:
                     await self.client.send_message(
                         chat_id,
                         f"✅ Modello aggiornato a: `{norm}`",
-                        reply_markup=self.get_reply_keyboard(),
+                        reply_markup=self.get_reply_keyboard("agy"),
                         parse_mode="Markdown"
                     )
                     self.ui.log_success(f"Model switched to {norm} via Telegram")
@@ -1506,30 +2055,6 @@ class BotApp:
 
             if text_lower in ["/notify", "/notifiche", "notifiche", "🔔 notifiche", "notifica"]:
                 await self.cmd_notify(chat_id)
-                return
-
-            if text_lower in ["🎛️ opzioni agy", "opzioni agy", "opzioni", "/agy", "/opzioni", "/tools", "agy"]:
-                await self.cmd_agy_options(chat_id)
-                return
-
-            if text_lower in ["/usage", "/quota", "usage", "quota"]:
-                await self.cmd_usage(chat_id)
-                return
-
-            if text_lower in ["/credits", "credits", "crediti", "/crediti"]:
-                await self.cmd_credits(chat_id)
-                return
-
-            if text_lower in ["/mcp", "mcp"]:
-                await self.cmd_mcp(chat_id)
-                return
-
-            if text_lower in ["/skills", "skills"]:
-                await self.cmd_skills(chat_id)
-                return
-
-            if text_lower in ["/agents", "agents", "agenti", "/agenti"]:
-                await self.cmd_agents(chat_id)
                 return
 
             if text_lower in ["/effort", "effort"]:
@@ -1632,9 +2157,9 @@ class BotApp:
                 # Poll tmux agy sessions (strictly filtered: only question choices or full completion)
                 events = await asyncio.to_thread(self.tmux.check_for_session_events)
                 for ev in events:
-                    w_name = ev["window_name"]
-                    t_target = ev["target"]
-                    sub_info = f" • 🤖 `{ev['subagents_count']} subagenti`" if ev.get("subagents_count") else ""
+                    w_name = str(ev.get("window_name") or ev.get("target") or "session")
+                    t_target = str(ev.get("target") or "")
+                    sub_info = f" • 🤖 `{ev.get('subagents_count') or 0} subagenti`" if ev.get("subagents_count") else ""
 
                     if ev["event_type"] == "question":
                         q_msg = (
@@ -1731,6 +2256,7 @@ def main():
         sys.exit(1)
 
     app = BotApp()
+    app.lock_file = lock_file
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -1748,8 +2274,16 @@ def main():
         loop.run_until_complete(app.run())
     except KeyboardInterrupt:
         pass
+    except Exception as e:
+        logger.exception(f"Unhandled fatal error in bot run: {e}")
+        app.ui.log_error(f"Fatal error: {e}")
     finally:
         loop.close()
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+            lock_file.close()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()

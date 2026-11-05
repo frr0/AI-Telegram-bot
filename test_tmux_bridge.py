@@ -29,6 +29,12 @@ class TestTmuxBridge(unittest.TestCase):
         card = self.bridge.format_sessions_card()
         self.assertIn("Sessioni Antigravity su tmux", card)
 
+    def test_discover_all_sessions(self):
+        all_sessions = self.bridge.discover_all_sessions(include_aibot=True)
+        self.assertIsInstance(all_sessions, list)
+        card_all = self.bridge.format_sessions_card(only_agy=False)
+        self.assertIn("Sessioni Tmux", card_all)
+
     def test_running_subagents_do_not_require_intervention(self):
         sample = """
   • Milestone 1 completata
@@ -166,6 +172,24 @@ Build succeeded.
             sname = self.bridge.create_session("my_chat")
             self.assertIsNone(sname)
 
+    @patch("subprocess.run")
+    def test_send_special_key(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0)
+        success = self.bridge.send_key("0:1.0", "C-c")
+        self.assertTrue(success)
+        mock_run.assert_called_once()
+        args = mock_run.call_args[0][0]
+        self.assertEqual(args, ["tmux", "send-keys", "-t", "0:1.0", "C-c"])
+
+    @patch("subprocess.run")
+    def test_kill_session(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0)
+        success = self.bridge.kill_session("chat_12345")
+        self.assertTrue(success)
+        mock_run.assert_called_once()
+        args = mock_run.call_args[0][0]
+        self.assertEqual(args, ["tmux", "kill-session", "-t", "chat_12345"])
+
     def test_cmd_new_creates_tmux_session(self):
         from unittest.mock import AsyncMock
         from main import BotApp
@@ -184,6 +208,369 @@ Build succeeded.
         sent_text = app.client.send_message.call_args[0][1]
         self.assertIn("chat_20261105_131500", sent_text)
         self.assertIn("tmux a -t chat_20261105_131500", sent_text)
+
+    def test_attached_session_routes_message(self):
+        from unittest.mock import AsyncMock
+        from main import BotApp
+        app = BotApp()
+        app.client = MagicMock()
+        app.client.send_message = AsyncMock()
+        app.config = MagicMock()
+        app.config.is_user_allowed.return_value = True
+        app.tmux = MagicMock()
+        app.tmux.send_input.return_value = True
+        app.tmux.capture_session_screen.return_value = "Prompt output here"
+        app.active_tmux_target = "chat_20261105"
+        app.active_tmux_name = "chat_20261105"
+
+        import asyncio
+        asyncio.run(app.process_telegram_update({"message": {"from": {"id": 12345}, "chat": {"id": 12345}, "text": "ls -la"}}))
+
+        app.tmux.send_input.assert_called_once_with("chat_20261105", "ls -la")
+
+    @patch("subprocess.run")
+    def test_discover_sessions_includes_session_name(self, mock_run):
+        mock_res = MagicMock()
+        mock_res.returncode = 0
+        mock_res.stdout = "chat_20261105:0.0|99999|agy|python3\n"
+        mock_run.return_value = mock_res
+        sessions = self.bridge.discover_sessions(only_agy=False, include_aibot=True)
+        self.assertEqual(len(sessions), 1)
+        sess = sessions[0]
+        self.assertEqual(sess["target"], "chat_20261105:0.0")
+        self.assertEqual(sess["session_name"], "chat_20261105")
+        self.assertEqual(sess["name"], "chat_20261105")
+        self.assertEqual(sess["window_name"], "agy")
+
+    def test_attach_callback_handles_missing_session_name_key(self):
+        from unittest.mock import AsyncMock
+        from main import BotApp
+        app = BotApp()
+        app.client = MagicMock()
+        app.client.send_message = AsyncMock()
+        app.client.answer_callback_query = AsyncMock()
+        app.config = MagicMock()
+        app.config.is_user_allowed.return_value = True
+        app.tmux = MagicMock()
+        # Session dicts completely missing 'session_name'
+        app.tmux.discover_all_sessions.return_value = [
+            {"target": "worker:0.0", "window_name": "worker"},
+            {"target": "chat_20261105:0.0", "window_name": "agy"}
+        ]
+        app.cmd_tmux_screen = AsyncMock()
+
+        update = {
+            "update_id": 100,
+            "callback_query": {
+                "id": "cq100",
+                "from": {"id": 12345, "first_name": "Test"},
+                "message": {"chat": {"id": 12345}, "message_id": 10},
+                "data": "tmux:attach:chat_20261105:0.0"
+            }
+        }
+        import asyncio
+        asyncio.run(app.process_telegram_update(update))
+
+        self.assertEqual(app.active_tmux_target, "chat_20261105:0.0")
+        self.assertEqual(app.active_tmux_name, "agy")
+        app.client.answer_callback_query.assert_any_call("cq100", "🎯 Agganciato a agy!", show_alert=False)
+
+    def test_attach_command_handles_missing_session_name_and_key_variations(self):
+        from unittest.mock import AsyncMock
+        from main import BotApp
+        app = BotApp()
+        app.client = MagicMock()
+        app.client.send_message = AsyncMock()
+        app.config = MagicMock()
+        app.config.is_user_allowed.return_value = True
+        app.tmux = MagicMock()
+        # Heterogeneous dictionaries without 'session_name'
+        app.tmux.discover_all_sessions.return_value = [
+            {"target": "worker:0.0", "window_name": "worker"},
+            {"target": "chat_20261105:0.0", "window_name": "agy"}
+        ]
+        app.cmd_tmux_screen = AsyncMock()
+
+        import asyncio
+        update = {
+            "update_id": 101,
+            "message": {
+                "message_id": 2,
+                "from": {"id": 12345, "first_name": "Test"},
+                "chat": {"id": 12345},
+                "text": "/attach agy"
+            }
+        }
+        asyncio.run(app.process_telegram_update(update))
+
+        self.assertEqual(app.active_tmux_target, "chat_20261105:0.0")
+        self.assertEqual(app.active_tmux_name, "agy")
+
+    def test_send_command_matches_session_name(self):
+        from unittest.mock import AsyncMock
+        from main import BotApp
+        app = BotApp()
+        app.client = MagicMock()
+        app.client.send_message = AsyncMock()
+        app.tmux = MagicMock()
+        app.tmux.discover_all_sessions.return_value = [
+            {"target": "chat_123:0.0", "window_name": "worker_win", "session_name": "chat_123"}
+        ]
+        app.tmux.send_input.return_value = True
+
+        import asyncio
+        asyncio.run(app.cmd_send("chat_123 status", chat_id=12345))
+
+        app.tmux.send_input.assert_called_once_with("chat_123:0.0", "status")
+
+    def test_screen_capture_markdown_sanitization(self):
+        from unittest.mock import AsyncMock
+        from main import BotApp
+        app = BotApp()
+        app.client = MagicMock()
+        app.client.send_message = AsyncMock()
+        app.tmux = MagicMock()
+        app.tmux.capture_session_screen.return_value = "```python\nprint('hello')\n```"
+
+        import asyncio
+        asyncio.run(app.cmd_tmux_screen("0:1.0", chat_id=12345))
+
+        app.client.send_message.assert_called_once()
+        sent_text = app.client.send_message.call_args[1].get("text") or app.client.send_message.call_args[0][1]
+        self.assertNotIn("```python", sent_text)
+        self.assertIn("'''python", sent_text)
+
+    def test_callback_key_preserves_colon_target(self):
+        """Regression test for callback delimiter truncation bug in tmux:key:."""
+        from unittest.mock import AsyncMock
+        from main import BotApp
+        app = BotApp()
+        app.client = MagicMock()
+        app.client.answer_callback_query = AsyncMock()
+        app.config.allowed_user_ids = [12345]
+        app.tmux = MagicMock()
+        app.tmux.send_key.return_value = True
+        app.cmd_tmux_screen = AsyncMock()
+
+        test_cases = [
+            ("tmux:key:0:1.0:C-c", "0:1.0", "C-c"),
+            ("tmux:key:chat_1:0.0:Enter", "chat_1:0.0", "Enter"),
+            ("tmux:key:chat_20261105_131500:0.0:C-c", "chat_20261105_131500:0.0", "C-c"),
+        ]
+
+        import asyncio
+        for cb_data, expected_target, expected_key in test_cases:
+            app.tmux.send_key.reset_mock()
+            update = {
+                "update_id": 100,
+                "callback_query": {
+                    "id": "cq_key",
+                    "from": {"id": 12345},
+                    "message": {"chat": {"id": 12345}, "message_id": 42},
+                    "data": cb_data
+                }
+            }
+            asyncio.run(app.process_telegram_update(update))
+            app.tmux.send_key.assert_called_once_with(expected_target, expected_key)
+
+    def test_callback_send_preserves_colon_target(self):
+        """Regression test for callback delimiter truncation bug in tmux:send:."""
+        from unittest.mock import AsyncMock
+        from main import BotApp
+        app = BotApp()
+        app.client = MagicMock()
+        app.client.answer_callback_query = AsyncMock()
+        app.config.allowed_user_ids = [12345]
+        app.tmux = MagicMock()
+        app.tmux.send_input.return_value = True
+        app.cmd_tmux_screen = AsyncMock()
+
+        test_cases = [
+            ("tmux:send:0:1.0:1", "0:1.0", "1"),
+            ("tmux:send:0:1.0:y", "0:1.0", "y"),
+            ("tmux:send:chat_20261105_131500:0.0:2", "chat_20261105_131500:0.0", "2"),
+        ]
+
+        import asyncio
+        for cb_data, expected_target, expected_val in test_cases:
+            app.tmux.send_input.reset_mock()
+            update = {
+                "update_id": 101,
+                "callback_query": {
+                    "id": "cq_send",
+                    "from": {"id": 12345},
+                    "message": {"chat": {"id": 12345}, "message_id": 42},
+                    "data": cb_data
+                }
+            }
+            asyncio.run(app.process_telegram_update(update))
+            app.tmux.send_input.assert_called_once_with(expected_target, expected_val)
+
+    def test_attach_callback_multiwindow_exact_target(self):
+        """Regression test: multi-window session attachment must match exact window target."""
+        from unittest.mock import AsyncMock
+        from main import BotApp
+        app = BotApp()
+        app.client = MagicMock()
+        app.client.send_message = AsyncMock()
+        app.client.answer_callback_query = AsyncMock()
+        app.config.allowed_user_ids = [12345]
+        app.tmux = MagicMock()
+        app.tmux.discover_all_sessions.return_value = [
+            {"target": "chat_1:0.0", "window_name": "win0", "session_name": "chat_1"},
+            {"target": "chat_1:1.0", "window_name": "win1", "session_name": "chat_1"}
+        ]
+        app.cmd_tmux_screen = AsyncMock()
+
+        import asyncio
+        update = {
+            "update_id": 102,
+            "callback_query": {
+                "id": "cq_win1",
+                "from": {"id": 12345},
+                "message": {"chat": {"id": 12345}, "message_id": 42},
+                "data": "tmux:attach:chat_1:1.0"
+            }
+        }
+        asyncio.run(app.process_telegram_update(update))
+
+        self.assertEqual(app.active_tmux_target, "chat_1:1.0")
+        self.assertEqual(app.active_tmux_name, "win1")
+
+    def test_kill_callbacks_preserve_colon_target(self):
+        """Regression test for kill_ask and kill_confirm callbacks with colon target."""
+        from unittest.mock import AsyncMock
+        from main import BotApp
+        app = BotApp()
+        app.client = MagicMock()
+        app.client.edit_message_text = AsyncMock()
+        app.client.answer_callback_query = AsyncMock()
+        app.client.send_message = AsyncMock()
+        app.config.allowed_user_ids = [12345]
+        app.tmux = MagicMock()
+        app.tmux.kill_session.return_value = True
+
+        target = "chat_20261105:0.0"
+        import asyncio
+
+        # 1. kill_ask
+        update_ask = {
+            "update_id": 103,
+            "callback_query": {
+                "id": "cq_kask",
+                "from": {"id": 12345},
+                "message": {"chat": {"id": 12345}, "message_id": 42},
+                "data": f"tmux:kill_ask:{target}"
+            }
+        }
+        asyncio.run(app.process_telegram_update(update_ask))
+        app.client.edit_message_text.assert_awaited()
+        edit_text = app.client.edit_message_text.call_args[1]["text"]
+        self.assertIn(target, edit_text)
+
+        # 2. kill_confirm
+        update_confirm = {
+            "update_id": 104,
+            "callback_query": {
+                "id": "cq_kconf",
+                "from": {"id": 12345},
+                "message": {"chat": {"id": 12345}, "message_id": 42},
+                "data": f"tmux:kill_confirm:{target}"
+            }
+        }
+        asyncio.run(app.process_telegram_update(update_confirm))
+        app.tmux.kill_session.assert_called_with(target)
+
+    def test_screen_capture_boundaries_and_sanitization(self):
+        """Regression test for screen markdown sanitization, large buffer truncation, and empty screens."""
+        from unittest.mock import AsyncMock
+        from main import BotApp
+        app = BotApp()
+        app.client = MagicMock()
+        app.client.send_message = AsyncMock()
+        app.tmux = MagicMock()
+
+        import asyncio
+
+        # Case A: Nested triple backticks
+        app.tmux.capture_session_screen.return_value = "```python\ndef test():\n    pass\n```"
+        asyncio.run(app.cmd_tmux_screen("0:1.0", chat_id=12345))
+        sent_text = app.client.send_message.call_args[1].get("text") or app.client.send_message.call_args[0][1]
+        self.assertNotIn("```python", sent_text)
+        self.assertIn("'''python", sent_text)
+
+        # Case B: Large screen buffer (> 4000 chars)
+        app.client.send_message.reset_mock()
+        app.tmux.capture_session_screen.return_value = "X" * 10000
+        asyncio.run(app.cmd_tmux_screen("0:1.0", chat_id=12345))
+        sent_text = app.client.send_message.call_args[1].get("text") or app.client.send_message.call_args[0][1]
+        self.assertLess(len(sent_text), 4000)
+        self.assertIn("X" * 3500, sent_text)
+        self.assertNotIn("X" * 3501, sent_text)
+
+        # Case C: Empty screen
+        app.client.send_message.reset_mock()
+        app.tmux.capture_session_screen.return_value = ""
+        asyncio.run(app.cmd_tmux_screen("0:1.0", chat_id=12345))
+        sent_text = app.client.send_message.call_args[1].get("text") or app.client.send_message.call_args[0][1]
+        self.assertIn("```text\n\n```", sent_text)
+
+    def test_bridge_consumers_resilience_malformed_sessions(self):
+        """Regression test: format_sessions_card and check_for_session_events handle malformed dicts safely."""
+        malformed_sessions = [
+            {},
+            {"target": "0:1.0", "window_name": "agy", "is_agy": True},  # Missing subagents_count
+            {"target": None, "window_name": None, "session_name": None},
+            {"dummy_key": "dummy_val"}
+        ]
+
+        # format_sessions_card (only_agy=True and False)
+        with patch.object(self.bridge, "discover_sessions", return_value=malformed_sessions):
+            card_agy = self.bridge.format_sessions_card(only_agy=True)
+            self.assertIsInstance(card_agy, str)
+            card_all = self.bridge.format_sessions_card(only_agy=False)
+            self.assertIsInstance(card_all, str)
+
+        # check_for_session_events
+        with patch.object(self.bridge, "discover_agy_sessions", return_value=malformed_sessions):
+            with patch.object(self.bridge, "inspect_pane", return_value={"subagents_count": 0, "requires_intervention": False, "is_completed": False, "choices": [], "snippet": ""}):
+                events = self.bridge.check_for_session_events()
+                self.assertIsInstance(events, list)
+
+    def test_bot_session_lookup_edge_cases(self):
+        """Regression test: BotApp session lookup handles integer names, None targets, and empty dicts."""
+        from unittest.mock import AsyncMock
+        from main import BotApp
+        app = BotApp()
+        app.client = MagicMock()
+        app.client.send_message = AsyncMock()
+        app.config.allowed_user_ids = [12345]
+        app.tmux = MagicMock()
+        app.tmux.send_input.return_value = True
+
+        app.tmux.discover_all_sessions.return_value = [
+            {},
+            {"target": None, "session_name": None, "name": None, "window_name": None},
+            {"target": "worker:0.0", "window_name": "worker", "name": 9999},
+        ]
+        app.cmd_tmux_screen = AsyncMock()
+
+        import asyncio
+        # /attach command with tricky input
+        update = {
+            "update_id": 105,
+            "message": {
+                "message_id": 5,
+                "from": {"id": 12345, "first_name": "Test"},
+                "chat": {"id": 12345},
+                "text": "/attach worker"
+            }
+        }
+        asyncio.run(app.process_telegram_update(update))
+
+        # cmd_send with integer and missing targets
+        asyncio.run(app.cmd_send("worker status", chat_id=12345))
+        app.client.send_message.assert_awaited()
 
 
 if __name__ == "__main__":
