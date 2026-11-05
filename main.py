@@ -4,6 +4,7 @@ import logging
 import signal
 import sys
 import time
+from datetime import datetime
 from typing import Optional, Dict, List, Any
 
 from config import Config
@@ -303,17 +304,42 @@ class BotApp:
                 )
 
     async def cmd_new(self, chat_id: Optional[int] = None):
-        """Resets the conversation and starts a new session."""
+        """Resets the conversation, creates a new tmux session, and starts a fresh session."""
         target_chat = chat_id or self.last_chat_id
         if self.engine:
             self.engine.reset_conversation()
         self.history.new_session()
         self.pending_choices.clear()
-        self.ui.log_success("Conversation reset. Started a fresh session.")
+
+        # Create a new session on tmux for this chat
+        tmux_session = None
+        if self.tmux and self.tmux.is_tmux_available():
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            sname = f"chat_{ts}"
+            tmux_session = await asyncio.to_thread(
+                self.tmux.create_session,
+                session_name=sname,
+                cwd=self.config.workspace_path,
+                window_name="agy"
+            )
+
+        log_extra = f" (tmux: {tmux_session})" if tmux_session else ""
+        self.ui.log_success(f"Conversation reset. Started a fresh session{log_extra}.")
         if target_chat and self.client:
+            msg = "🔄 *Nuova sessione di chat avviata!*\nLa conversazione precedente è stata archiviata."
+            if tmux_session:
+                msg += (
+                    f"\n\n🖥️ *Nuova sessione tmux creata:* `{tmux_session}`\n"
+                    f"• *Finestra:* `agy` (in `{self.config.workspace_path}`)\n"
+                    f"• *Collegamento da PC:* `tmux a -t {tmux_session}`\n"
+                    f"• *Da Telegram:* usa `/tmux` per visualizzare lo schermo e interagire."
+                )
+            else:
+                msg += "\nPuoi iniziare con una nuova richiesta."
+
             await self.client.send_message(
                 target_chat,
-                "🔄 *Nuova sessione di chat avviata!*\nLa conversazione precedente è stata archiviata. Puoi iniziare con una nuova richiesta.",
+                msg,
                 reply_markup=self.get_reply_keyboard(),
                 parse_mode="Markdown"
             )
@@ -545,8 +571,9 @@ class BotApp:
                 {"text": f"✍️ Invia Input: {w_name}", "callback_data": f"tmux:prompt:{target}"}
             ])
         keyboard_rows.append([
-            {"text": "🔄 Aggiorna Sessioni", "callback_data": "tmux:refresh"},
-            {"text": "🔙 Torna al Menu", "callback_data": "menu:main"}
+            {"text": "➕ Nuova Sessione Tmux", "callback_data": "tmux:new_session"},
+            {"text": "🔄 Aggiorna", "callback_data": "tmux:refresh"},
+            {"text": "🔙 Menu", "callback_data": "menu:main"}
         ])
         kb = self.client.build_inline_keyboard(keyboard_rows) if self.client else None
 
@@ -1229,6 +1256,18 @@ class BotApp:
                 await self.cmd_news(chat_id, message_id=msg.get("message_id"))
                 return
             elif data == "menu:tmux" or data == "tmux:refresh":
+                await self.cmd_tmux(chat_id, message_id=msg.get("message_id"))
+                return
+            elif data == "tmux:new_session":
+                sname = await asyncio.to_thread(
+                    self.tmux.create_session,
+                    cwd=self.config.workspace_path,
+                    window_name="agy"
+                )
+                if sname:
+                    await self.client.answer_callback_query(query_id, f"✅ Creata sessione tmux: {sname}", show_alert=True)
+                else:
+                    await self.client.answer_callback_query(query_id, "❌ Impossibile creare sessione tmux", show_alert=True)
                 await self.cmd_tmux(chat_id, message_id=msg.get("message_id"))
                 return
             elif data.startswith("tmux:screen:"):

@@ -3,6 +3,8 @@ import os
 import re
 import shutil
 import subprocess
+import time
+from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple, Set
 
 
@@ -250,6 +252,54 @@ class TmuxBridge:
             return res.returncode == 0
         except Exception:
             return False
+
+    def create_session(
+        self,
+        session_name: Optional[str] = None,
+        cwd: Optional[str] = None,
+        window_name: str = "agy",
+        command: Optional[str] = None
+    ) -> Optional[str]:
+        """
+        Creates a new tmux session running an agy instance in the background.
+        Returns the session name if created successfully, or None on failure.
+        """
+        if not self.is_tmux_available():
+            return None
+
+        if not session_name:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            session_name = f"chat_{timestamp}"
+
+        # Clean session name: allow only alphanumeric, underscores, hyphens
+        clean_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', session_name).strip("-_")
+        if not clean_name:
+            clean_name = f"chat_{int(time.time())}"
+
+        if not command:
+            agy_cmd = shutil.which("agy") or os.path.expanduser("~/.local/bin/agy") or "agy"
+            command = f"{agy_cmd}; exec ${{SHELL:-bash}}"
+
+        cmd = ["tmux", "new-session", "-d", "-s", clean_name, "-n", window_name]
+        if cwd and os.path.isdir(cwd):
+            cmd.extend(["-c", cwd])
+        cmd.append(command)
+
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            if res.returncode == 0:
+                return clean_name
+            # If session name already exists, append unique timestamp suffix
+            if "duplicate session" in res.stderr.lower():
+                clean_name = f"{clean_name}_{int(time.time())}"
+                cmd[cmd.index("-s") + 1] = clean_name
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+                if res.returncode == 0:
+                    return clean_name
+        except Exception:
+            pass
+
+        return None
 
     def check_for_session_events(self) -> List[Dict[str, Any]]:
         """

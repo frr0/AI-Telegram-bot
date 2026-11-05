@@ -139,6 +139,52 @@ Build succeeded.
                 self.assertEqual(len(events_agents_done), 1)
                 self.assertEqual(events_agents_done[0]["event_type"], "completed")
 
+    @patch("subprocess.run")
+    def test_create_session_success(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        sname = self.bridge.create_session("my-test-chat", cwd="/tmp")
+        self.assertEqual(sname, "my-test-chat")
+        mock_run.assert_called_once()
+        args = mock_run.call_args[0][0]
+        self.assertIn("tmux", args)
+        self.assertIn("new-session", args)
+        self.assertIn("my-test-chat", args)
+
+    @patch("subprocess.run")
+    def test_create_session_duplicate_retry(self, mock_run):
+        mock_run.side_effect = [
+            MagicMock(returncode=1, stdout="", stderr="duplicate session: my_chat"),
+            MagicMock(returncode=0, stdout="", stderr="")
+        ]
+        sname = self.bridge.create_session("my_chat", cwd="/tmp")
+        self.assertIsNotNone(sname)
+        self.assertTrue(sname.startswith("my_chat_"))
+        self.assertEqual(mock_run.call_count, 2)
+
+    def test_create_session_tmux_unavailable(self):
+        with patch.object(self.bridge, "is_tmux_available", return_value=False):
+            sname = self.bridge.create_session("my_chat")
+            self.assertIsNone(sname)
+
+    def test_cmd_new_creates_tmux_session(self):
+        from unittest.mock import AsyncMock
+        from main import BotApp
+        app = BotApp()
+        app.client = MagicMock()
+        app.client.send_message = AsyncMock()
+        app.tmux = MagicMock()
+        app.tmux.is_tmux_available.return_value = True
+        app.tmux.create_session.return_value = "chat_20261105_131500"
+
+        import asyncio
+        asyncio.run(app.cmd_new(chat_id=12345))
+
+        app.tmux.create_session.assert_called_once()
+        app.client.send_message.assert_called_once()
+        sent_text = app.client.send_message.call_args[0][1]
+        self.assertIn("chat_20261105_131500", sent_text)
+        self.assertIn("tmux a -t chat_20261105_131500", sent_text)
+
 
 if __name__ == "__main__":
     unittest.main()
